@@ -41,6 +41,7 @@ includeos.pkgs.mkShell.override { inherit (includeos) stdenv; } rec {
     includeos.pkgs.iputils
     includeos.pkgs.xorriso
     includeos.pkgs.jq
+    includeos.pkgs.gdb
   ];
 
   # libraries/headers we include against

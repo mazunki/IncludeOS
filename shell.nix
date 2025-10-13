@@ -37,6 +37,7 @@ includeos.pkgs.mkShell.override { inherit (includeos) stdenv; } rec {
     includeos.pkgs.grub2
     includeos.pkgs.iputils
     includeos.pkgs.xorriso
+    includeos.pkgs.gdb
   ];
 
   buildInputs = [
