@@ -4,18 +4,21 @@
 #ifndef	_SYS_MMAN_HPP
 #define	_SYS_MMAN_HPP
 
+#include "os.hpp"
 #include <cstdint>
 #include <sys/mman.h>
 #include <util/bitops.hpp>
 #include <type_traits>
 
 namespace os::mem {
+  // enum class Sharing : uint8_t {};  // TODO(mazunki): Flags::{SHARED,PRIVATE} are mutually exclusive
+
   enum class Flags : uint8_t {
     None      = 0,
-    Shared    = MAP_SHARED,
-    Private   = MAP_PRIVATE,
-    Fixed     = MAP_FIXED,
-    Anonymous = MAP_ANONYMOUS,
+    Shared    = MAP_SHARED,     // Changes are visible to other mappings of the same region, and file-backed allocations are valid
+    Private   = MAP_PRIVATE,    // Creates a private copy-on-write mapping, does not write to underlying file. Changes to file after mmap is unspecified.
+    Fixed     = MAP_FIXED,      // Place mapping specifically at `addr` (must be aligned, i.e. multiple of PAGE_SIZE)
+    Anonymous = MAP_ANONYMOUS,  // Not backed by any file, content initialized to zero, requires: fd=-1, offset is ignored
   };
 
   enum class Permission : uint8_t {  // TODO(mazunki): consider making Permission::{Read,Write,Execute} private or standalone class

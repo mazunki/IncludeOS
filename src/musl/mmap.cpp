@@ -55,56 +55,80 @@ uintptr_t mmap_allocation_end() {
 }
 
 static void* sys_mmap(void * addr, size_t length, int /*prot*/, int _flags,
-                      int fd, off_t /*offset*/)
+                      int _fd, off_t offset)
 {
+  // NOTE: `must` and `should` messages in this function refer to POSIX mmap(3p)
   using os::mem::Flags;
+
   const Flags flags = static_cast<Flags>(_flags);
+  const std::optional<int> file_descriptor = (_fd == -1) ? std::nullopt : std::optional<int>(_fd);
+
+  // TODO(mazunki): this could become a constexpr by making os::mem::Sharing a mutually exclusive type
+  if (util::has_flag(flags, Flags::Private) == util::has_flag(flags, Flags::Shared)) {
+    Expects(false && "sys_mmap: mapping must be either Private xor Shared");
+    errno = EINVAL;
+    return MAP_FAILED;
+  }
+
+  if (length == 0) {
+    Expects(false && "Mapping must never allocate 0 bytes");
+    errno = EINVAL;
+    return MAP_FAILED;
+  }
+
+  if (util::has_flag(Flags::Anonymous)) {
+    if (file_descriptor) {
+      Expects(false && "Anonymous mappings must set fd=-1");  // TODO(mazunki): rename -1 when signature changes
+      errno = EINVAL;
+      return MAP_FAILED;
+    }
+    if (offset != 0) {
+      Expects(false && "Anonymous mappings should have offset=0");
+      errno = EINVAL;
+      return MAP_FAILED;
+    }
+  }
+
+  // NOTE: specifying an address with non-fixed allocation is, per spec, only
+  // a hint. for now, we ignore this hint.
+  if ((addr != 0) && util::missing_flag(flags, Flags::Fixed))  {
+    addr = 0;
+  }
+
 
   // TODO: Implement minimal functionality to be POSIX compliant
   // https://pubs.opengroup.org/onlinepubs/009695399/functions/mmap.html
 
-  if (fd > -1) {
-    // None of our file systems support memory mapping at the moment
-    Expects(false && "Mapping to file descriptor not supported");
-    errno = ENODEV;
+  if (file_descriptor) {
+    Expects(false && "Mapping to file descriptor is not yet implemented");
+    errno = ENOTSUP;
     return MAP_FAILED;
   }
 
   if (util::missing_flag(flags, Flags::Anonymous)) {
-    Expects(false && "We only support MAP_ANONYMOUS calls to mmap()");
+    Expects(false && "Support for non-MAP_ANONYMOUS mappings is not yet implemented");
     errno = ENOTSUP;
     return MAP_FAILED;
   }
 
   if (util::has_flag(flags, Flags::Fixed)) {
-    Expects(false && "MAP_FIXED not supported.");
+    Expects(false && "Support for MAP_FIXED mappings is not yet implemented.");
     errno = ENOTSUP;
     return MAP_FAILED;
   }
 
-  if (util::has_flag(flags, Flags::Private) && util::missing_flag(flags, Flags::Anonymous)) {
-    Expects(false && "MAP_PRIVATE only supported for MAP_ANONYMOS");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  if (util::has_flag(flags, Flags::Private)) {
+    if (util::missing_flag(flags, Flags::Anonymous)) {
+      Expects(false && "Support for MAP_PRIVATE other than MAP_ANONYMOUS is not yet implemented");
+      errno = ENOTSUP;
+      return MAP_FAILED;
+    }
+    if (addr != 0) {
+      Expects(false && "Support for MAP_PRIVATE other than for new allocations (addr=0) is not yet implemented");
+      errno = ENOTSUP;
+      return MAP_FAILED;
+    }
   }
-
-  if (util::has_flag(flags, Flags::Private) && (addr != 0)) {
-    Expects(false && "MAP_PRIVATE only supported for new allocations (address=0).");
-    errno = ENOTSUP;
-    return MAP_FAILED;
-  }
-
-  if (util::missing_flag(flags, Flags::Shared) && util::missing_flag(flags, Flags::Private)) {
-    Expects(false && "MAP_SHARED or MAP_PRIVATE must be set.");
-    errno = ENOTSUP;
-    return MAP_FAILED;
-  }
-
-  // If we get here, the following should be true:
-  //
-  // MAP_ANONYMOUS set + MAP_SHARED or MAP_PRIVATE
-  // fd should be 0, address should be 0 for MAP_PRIVATE
-  // (address is in any case ignored)
 
   auto* res = kalloc(length);
 
