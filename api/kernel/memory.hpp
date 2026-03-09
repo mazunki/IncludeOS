@@ -37,13 +37,13 @@ namespace os::mem {
     execute = 4
   };
 
-  using Raw_allocator = buddy::Alloc<false>;
+  using Raw_allocator = os::mem::mem_resource;
 
   /** Get default allocator for untyped allocations */
-  Raw_allocator& raw_allocator();
+  os::mem::mem_resource& raw_allocator();
 
   template <typename T>
-  using Typed_allocator = Allocator<T, Raw_allocator>;
+  using Typed_allocator = Allocator<T, os::mem::mem_resource>;
 
   /** Get default std::allocator for typed allocations */
   template <typename T>

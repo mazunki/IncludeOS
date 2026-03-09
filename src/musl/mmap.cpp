@@ -2,27 +2,49 @@
 #include <cstdint>
 #include <sys/mman.h>
 #include <errno.h>
+#include <mem/mem.hpp>
 #include <mem/alloc/buddy.hpp>
 #include <os>
 #include <kernel/memory.hpp>
 #include <kernel.hpp>
 #include <kprint>
+#include <new>
+#include <cstring>
 
-using Alloc = os::mem::Raw_allocator;
-static Alloc* alloc;
+static os::mem::buddy_resource* buddy_alloc = nullptr;
+static os::mem::mem_resource* alloc = nullptr;
 
-Alloc& os::mem::raw_allocator() {
+os::mem::mem_resource& os::mem::raw_allocator() {
   Expects(alloc);
   return *alloc;
 }
 
 uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
 {
-  auto aligned_begin = (addr_begin + Alloc::align - 1) & ~(Alloc::align - 1);
-  int64_t len = size & ~int64_t(Alloc::align - 1);
+  size_t align = PAGE_SIZE; // os::mem::min_psize();
+  auto aligned_begin = (addr_begin + align - 1) & ~(align - 1);
+  auto aligned_end   = (addr_begin + size) & ~(uintptr_t(align - 1));
 
-  alloc = Alloc::create((void*)aligned_begin, len);
-  return aligned_begin + len;
+  if (aligned_end <= aligned_begin) {
+    return aligned_begin;
+  }
+
+  auto* self = reinterpret_cast<void*>(aligned_begin);
+  uintptr_t usable_begin = aligned_begin + sizeof(os::mem::buddy_resource);
+
+  os::mem::mem_config cfg{
+    .region = { usable_begin, aligned_end },
+    .overbooking = false,
+  };
+
+  os::mem::buddy_config bcfg{
+    .min_block = align,
+  };
+
+  buddy_alloc = new (self) os::mem::buddy_resource(cfg, bcfg);
+  alloc = buddy_alloc;
+
+  return aligned_end;
 }
 
 extern "C" __attribute__((weak))
@@ -34,7 +56,7 @@ void* kalloc(size_t size) {
 extern "C" __attribute__((weak))
 void* kalloc_aligned(size_t alignment, size_t size) {
   Expects(kernel::heap_ready());
-  return alloc->do_allocate(size, alignment);
+  return alloc->allocate(size, alignment);
 }
 
 extern "C" __attribute__((weak))

@@ -14,738 +14,316 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#pragma once
+#include <memory_resource>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <new>
+#include <print>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+#include <algorithm>
 
-#ifndef UTIL_ALLOC_BUDDY_HPP
-#define UTIL_ALLOC_BUDDY_HPP
+#include <mem/mem.hpp>
 
-#include <sstream>
-#include <array>
-#include <span>
-#include <pmr>
-#include <stdlib.h>
-#include <math.h>
-#include <expects>
-#ifdef INCLUDEOS_SMP_ENABLE
-#include <mutex>
-#endif
+namespace os::mem {
 
-#include <util/bitops.hpp>
-#include <util/units.hpp>
+struct buddy_config {
+  std::size_t min_block = 64; // must be power of two
+};
 
-//
-// Tree node flags
-//
 
-namespace os::mem::buddy {
-  enum class Flags : uint8_t {
-    free = 0,
-    taken = 1,
-    left_used = 2,
-    right_used = 4,
-    left_full = 8,
-    right_full = 16
+class buddy_resource final : public mem_resource {
+public:
+  buddy_resource(mem_config cfg, buddy_config bcfg = {})
+    : mem_resource(cfg), cfg_(cfg), bcfg_(bcfg)
+  {
+    if (!std::has_single_bit(bcfg_.min_block)) {
+      throw std::invalid_argument("buddy min_block must be a power of two");
+    }
+
+    resource_base_ = cfg_.region.start;
+    if (resource_base_ >= cfg_.region.end) {
+      throw std::bad_alloc();
+    }
+
+    const std::size_t total_avail = static_cast<std::size_t>(cfg_.region.end - resource_base_);
+    const std::size_t provisional = std::bit_floor(total_avail);  // how many buds at max?
+    if (provisional < bcfg_.min_block) {
+      throw std::bad_alloc();
+    }
+
+    // these are provisional because the freelist might offset them slightly
+    const int provisional_min_order_ = order_for(0);
+    const int provisional_max_order_ = order_for(provisional);
+    const int provisional_orders_ = static_cast<std::size_t>((provisional_max_order_ - provisional_min_order_) + 1);
+
+    // this freelist is placed before the buddy tree
+    free_ = reinterpret_cast<FreeNode**>(resource_base_);
+    const std::size_t freelist_size = provisional_orders_ * sizeof(FreeNode*);
+
+    // the pool's (i.e. the colletion of buds) base starts after the buddy's metadata
+    pool_base_ = align_up(resource_base_ + freelist_size, bcfg_.min_block);
+    if (pool_base_ >= cfg_.region.end) {
+      throw std::bad_alloc();  // metadata took too much space
+    }
+
+    std::size_t avail = static_cast<std::size_t>(cfg_.region.end - pool_base_);
+    pool_size_ = std::bit_floor(avail);
+    if (pool_size_ < bcfg_.min_block) {
+      throw std::bad_alloc();  // can't even fit one bud in remaining space
+    }
+
+    min_order_ = order_for(0);
+    max_order_ = order_for(pool_size_);
+    orders_ = static_cast<std::size_t>((max_order_ - min_order_) + 1);
+
+    pool_end_ = pool_base_ + pool_size_;
+
+    for (std::size_t i = 0; i < orders_; ++i) {
+      free_[i] = nullptr;
+    }
+
+    // initial free block = whole pool
+    push_free(pool_base_, max_order_);
+  }
+
+  void dump_state() const noexcept {
+    std::println("buddy:");
+    std::println("  cfg.region:   [{:#x}, {:#x}) ({} bytes)",
+                 cfg_.region.start, cfg_.region.end,
+                 static_cast<std::size_t>(cfg_.region.end - cfg_.region.start));
+    std::println("  overbooking:   {}", cfg_.overbooking);
+
+    std::println("  min_block:     {}", bcfg_.min_block);
+    std::println("  resource_base: {:#x}", resource_base_);
+    std::println("  pool_base:     {:#x}", pool_base_);
+    std::println("  pool_end:      {:#x}", pool_end_);
+    std::println("  pool_size:     {} bytes (2^{})", pool_size_, max_order_);
+    std::println("  min_order:     {} (min bud = {} bytes)", min_order_, 1<<min_order_);
+    std::println("  max_order:     {} (max bud = {} bytes) ", max_order_, 1<<max_order_);
+  }
+
+  uintptr_t malloc(size_t bytes) {
+    return reinterpret_cast<uintptr_t>(this->strat_allocate(bytes, alignof(max_align_t)));
+  }
+
+  void free(uintptr_t addr, size_t bytes) {
+    this->strat_deallocate(addr, bytes, alignof(max_align_t));
+  }
+
+
+  size_t bytes_used() const noexcept override {
+    return 0;
   };
-}
-
-namespace util {
-  template<>
-  struct enable_bitmask_ops<os::mem::buddy::Flags> {
-    using type = uint8_t;
-    static constexpr bool enable = true;
+  size_t bytes_free() const noexcept override {
+    return 0;
   };
-}
+  uintptr_t highest_used() const noexcept override {
+    return 0;
+  };
 
-namespace os::mem::buddy {
-  using namespace util::literals;
-  using namespace util::bitops;
+protected:
+  std::string_view name() const noexcept override { return "buddy"; }
 
-  using Node_t    = uint8_t;
-  using Addr_t    = uintptr_t; // Use void* only at outermost api level
-  using Size_t    = size_t;
-  using Node_arr  = std::span<Node_t>;
-  using Index_t   = Node_arr::size_type;
+  std::uintptr_t strat_allocate(std::size_t bytes, std::size_t alignment) override {
+    // mem_resource already validated alignment is power-of-two, this is a requirement
 
-#ifdef INCLUDEOS_SMP_ENABLE
-  static Spinlock pmr_lock; // Lock PMR operations for SMP
-#endif
+    // buddy needs a block that is at least the size of the alignment
+    const std::size_t aligned_bytes = std::max(bytes, alignment);  // should we enforce this from outside?
+
+    const int want = order_for(aligned_bytes);
+    if (want > max_order_) {
+      throw std::bad_alloc();  // our tree is not big enough
+    }
+
+    // find smallest available order >= want
+    int have = want;
+    while (have <= max_order_ && free_[idx(have)] == nullptr) {
+      ++have;
+    }
+
+    if (have > max_order_) {
+      throw std::bad_alloc();  // couldn't find a free node of this size
+    }
+
+    // pop a block of order 'have' and split down to 'want'
+    std::uintptr_t addr = pop_free(have);
+
+    while (have > want) {
+      --have;
+      // split into [addr, addr+2^have) and [addr+2^have, addr+2^(have+1))
+      const std::uintptr_t right = addr + (std::uintptr_t(1) << have);
+      push_free(right, have);
+
+      // keep left half as addr
+    }
+
+    return addr;
+  }
+
+  void strat_deallocate(std::uintptr_t addr, std::size_t bytes, std::size_t alignment) noexcept override {
+    // this assumes addr is both valid and allocated
+
+    if (addr < pool_base_ || addr >= pool_end_) {
+      // if caller frees something outside the pool, ignore (we avoid throwing for performance)
+      return;
+    }
+
+    const std::size_t need = std::max(bytes, alignment);
+    int order = order_for(need);
+    if (order > max_order_) {
+      // the caller tried to deallocate something bigger than us... this is bad!
+      return;
+    }
+
+    // merge while buddy is free at same order
+    while (order < max_order_) {
+      const std::uintptr_t bud = buddy_of(addr, order);
+
+      // buddies must also be within pool; if not, stop. (TODO: can this happen?)
+      if (bud < pool_base_ || bud >= pool_end_) {
+        break;
+      }
+
+      // if buddy block is currently free at this order, remove it
+      if (!remove_if_free(bud, order)) {
+        // sadly, the bud wasn't free. we have introduced fragmentation (TODO: add stats for this?)
+        break;
+      }
+
+      // and merge!
+      addr = std::min(addr, bud);
+      ++order;
+    }
+
+    push_free(addr, order);
+  }
+
+  std::uintptr_t strat_allocate_at(std::uintptr_t addr, std::size_t bytes, std::size_t alignment) override {
+    // mem_resource already validated:
+    // - addr is aligned to 'alignment'
+    // - addr is within [region.start, region.end)
+    // - [addr, addr+bytes) fits in region
+    //
+    // buddy adds: we can only place at the beginning of a buddy block,
+    // and that exact block must be currently free
+    //
+    // TODO: permit overriding
+
+    if (addr < pool_base_ || addr >= pool_end_) {
+      throw std::bad_alloc();  // we have no control over the address requested!
+    }
+
+    const std::size_t need = std::max(bytes, alignment);
+    const int order = order_for(need);
+    if (order > max_order_) {
+      throw std::bad_alloc();  // the requested size is too big to fit in our pool
+    }
+
+    const std::uintptr_t block_size = (std::uintptr_t(1) << order);
+    if ( ((addr - pool_base_) & (block_size - 1)) != 0 ) {
+      throw std::bad_alloc();  // address isn't aligned to the requested size
+    }
+
+    if (!remove_if_free(addr, order)) {
+      throw std::bad_alloc();  // unable to take ownership of the node at this position
+    }
+    return addr;
+  }
+
+private:
+  struct FreeNode { FreeNode* next; }; // named as such because... they're free to be used
+
+  mem_config cfg_;
+  buddy_config bcfg_;
+
+  std::uintptr_t resource_base_{0};
+  std::uintptr_t pool_base_{0};
+  std::uintptr_t pool_end_{0};
+  std::size_t    pool_size_{0};
+
+  int min_order_{0};  // represents the order for the biggest bud available
+  int max_order_{0};  // represents the order for the tiniest bud available
+  std::size_t orders_{0};  // max-min, i.e. how many valid orders. used for freelist
+
+  FreeNode** free_{nullptr};
+
+  static std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment) noexcept {
+    const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
+    return (p + (a - 1)) & ~(a - 1);
+  }
 
   /**
-   * A buddy allocator over a fixed size pool
-   **/
-  template <bool Track_allocs = false>
-  struct Alloc : public std::pmr::memory_resource {
-    static constexpr mem::buddy::Size_t min_size  = 4096;
-    static constexpr mem::buddy::Size_t align = min_size;
-
-    static constexpr Index_t node_count(mem::buddy::Size_t pool_size){
-      return ((pool_size / min_size) * 2) - 1;
+   * gets the corresponding order k big enough to hold the requested size
+   *
+   * since buddy is a binary tree, we get:
+   *   order k => individual blocks of 2^k bytes
+   *
+   *  bytes should be aligned
+   */
+  int order_for(std::size_t bytes) const noexcept {
+    std::size_t n = std::max(bytes, bcfg_.min_block);
+    if (!std::has_single_bit(n)) {
+      n = std::bit_ceil(n);
     }
+    return static_cast<int>(std::countr_zero(n));
+  }
 
-    static constexpr Size_t overhead(Size_t pool_size) {
-      using namespace util;
-      auto nodes_size  = node_count(pool_size) * sizeof(Node_t);
-      auto overhead_   = bits::roundto(min_size, sizeof(Alloc) + nodes_size);
-      return overhead_;
-    }
+  /**
+   * gets the matching buddy for a given buddy at a given order
+   *
+   * [                  ]   parent spans 2^(order+1) bytes
+   * [ left    ][ right ]   <= order
+   * ^          ^
+   * addr       addr+2^order
+   */
+  std::uintptr_t buddy_of(std::uintptr_t addr, int order) const noexcept {
+    const std::uintptr_t off = addr - pool_base_;
+    return pool_base_ + (off ^ (std::uintptr_t(1) << order));
+  }
 
-    /**
-     * Indicate if the allocator should manage a power of 2 larger than- or
-     * smaller than available memory.
-     **/
-    enum class Policy {
-      underbook, overbook
-    };
+  /**
+   * converts an order into an index of the free-list.
+   * this prevents allocating free-nodes for illegal nodes
+   */
+  std::size_t idx(int order) const noexcept {
+    return static_cast<std::size_t>(order - min_order_);
+  }
 
-    /**
-     * Total allocatable memory in an allocator created in a bufsize buffer.
-     * If the policy is overbook, we compute the next power of two above bufsize,
-     * otherwise the next power of two below.
-     **/
-    template <Policy P>
-    static Size_t pool_size(Size_t bufsize){
-      using namespace util;
+  void push_free(std::uintptr_t p, int order) noexcept {
+    auto* n = reinterpret_cast<FreeNode*>(p);
+    n->next = free_[idx(order)];
+    free_[idx(order)] = n;
+  }
 
-      auto pool_sz = 0;
-      // Find closest usable power of two depending on policy
-      if constexpr (P == Policy::overbook) {
-          auto pow2 = bits::next_pow2(bufsize);
+  std::uintptr_t pop_free(int order) noexcept {
+    FreeNode* n = free_[idx(order)];
+    free_[idx(order)] = n->next;
+    return reinterpret_cast<std::uintptr_t>(n);
+  }
 
-          // On 32 bit we might easily overflow
-          if (pow2 > bufsize)
-            return pow2;
+  /*
+   * removes a node at the specified addr, for the specific order
+   *
+   * returns true if it was removed
+   * returns false if the node was busy
+   * */
+  bool remove_if_free(std::uintptr_t addr, int order) noexcept {
+    auto* target = reinterpret_cast<FreeNode*>(addr);
 
+    FreeNode** cur = &free_[idx(order)];
+    while (*cur) {
+      if (*cur == target) {
+        *cur = (*cur)->next;
+        return true;
       }
-
-      pool_sz = bits::keeplast(bufsize - 1); // -1 starts the recursion
-
-      auto unalloc   = bufsize - pool_sz;
-      auto overhead  = Alloc::overhead(pool_sz);
-
-      // If bufsize == overhead + pow2, and overhead was too small to fit alloc
-      // Try the next power of two recursively
-      if(unalloc < overhead)
-        return Alloc::pool_size<P>(pool_sz);
-
-      auto free = bufsize - overhead;
-      return bits::keeplast(free);
+      cur = &((*cur)->next);
     }
-
-
-   /**
-    * Maximum required bufsize to manage pool_size memory,
-    * assuming the whole pool will be available in memory.
-    **/
-    static Size_t max_bufsize(Size_t pool_size) {
-      using namespace util;
-      return bits::roundto(min_size, pool_size)
-        + overhead(pool_size);
-    }
-
-    /** Minimum total bufsize to manage pool_size memory **/
-    template <Policy P>
-    static Size_t min_bufsize(Size_t pool_size) {
-      using namespace util;
-
-      if constexpr (P == Policy::overbook) {
-          return overhead(pool_size);
-      }
-
-      return max_bufsize(pool_size);
-    }
-
-    Index_t node_count() const noexcept {
-      return node_count(pool_size_);
-    }
-
-    int leaf0() const noexcept {
-      return node_count() / 2 - 1;
-    }
-
-    int tree_height() const noexcept {
-      return util::bits::fls(node_count());
-    }
-
-    int tree_width() const noexcept {
-      return node_count() / 2 + 1;
-    }
-
-    Size_t max_chunksize() const noexcept {
-      // Same as pool size.
-      return min_size << (tree_height() - 1);
-    }
-
-    /** Theoretically allocatable capacity */
-    Size_t pool_size() const noexcept {
-      return pool_size_;
-    }
-
-    /** Total allocatable bytes, including allocated and free */
-    Size_t capacity() const noexcept {
-      return addr_limit_ - start_addr_;
-    }
-
-    /** Bytes unavailable in an overbooking allocator */
-    Size_t bytes_unavailable() const noexcept {
-      return pool_size_ - capacity();
-    }
-
-    Size_t bytes_used() const noexcept {
-      return bytes_used_;
-    }
-
-    Addr_t highest_used() const noexcept {
-      return std::min(root().highest_used_r(), start_addr_ + capacity());
-    }
-
-    Size_t bytes_free() const noexcept {
-      return pool_size_ - bytes_used_ - bytes_unavailable();
-    }
-
-    Size_t bytes_free_r() const noexcept {
-      return pool_size_ - root().bytes_used_r();
-    }
-
-    Size_t bytes_used_r() const noexcept {
-      return root().bytes_used_r();
-    }
-
-    bool full() {
-      return root().is_full();
-    }
-
-    bool overbooked() {
-      return overbooked_;
-    }
-
-    bool empty() {
-      return bytes_used() == 0;
-    }
-
-    Addr_t addr_begin() const noexcept {
-      return reinterpret_cast<Addr_t>(start_addr_);
-    }
-
-    Addr_t addr_end() const noexcept {
-      return start_addr_ + pool_size_;
-    }
-
-    bool in_range(void* a) const noexcept {
-      auto addr = reinterpret_cast<Addr_t>(a);
-      return addr >= addr_begin() and addr < addr_end();
-    }
-
-    static_assert(util::bits::is_pow2(min_size), "Page size must be power of 2");
-
-
-    Alloc(void* start, Size_t bufsize, Size_t pool_size)
-      : nodes_{(Node_t*)start, node_count(pool_size)},
-        start_addr_{util::bits::roundto(min_size, (Addr_t)start + node_count(pool_size))}, addr_limit_{reinterpret_cast<uintptr_t>(start) + bufsize},
-        pool_size_{pool_size}
-
-    {
-      using namespace util;
-      Expects(bits::is_pow2(pool_size_));
-      Expects(pool_size_ >= min_size);
-      Expects(bits::is_aligned<min_size>(start_addr_));
-      Ensures(bufsize >= overhead(pool_size));
-      // Initialize nodes
-      memset(nodes_.data(), 0, nodes_.size() * sizeof(Node_arr::element_type));
-    }
-
-    /**
-     * Create an allocator
-     **/
-    template <Policy P = Policy::overbook>
-    static Alloc* create(void* addr, Size_t bufsize) {
-      using namespace util;
-      Size_t pool_size_ = pool_size<P>(bufsize);
-      Expects(pool_size_ >= min_size);
-      Expects(bufsize >= min_bufsize<P>(pool_size_));
-      // Placement new an allocator on addr, passing in the rest of memory
-      auto* alloc_begin = (char*)addr + sizeof(Alloc);
-      auto* alloc       = new (addr) Alloc(alloc_begin,
-                                           bufsize - sizeof(Alloc),
-                                           pool_size_);
-      return alloc;
-    }
-
-
-    Size_t chunksize(Size_t wanted_sz) const noexcept {
-      auto sz = util::bits::next_pow2(wanted_sz);
-      if (sz > max_chunksize())
-        return 0;
-      return std::max(sz, min_size);
-    }
-
-    enum class Track {
-      get   = 0,
-      inc   = 1,
-      start = 2
-    };
-
-    struct Track_res {
-      int last;
-      int total;
-      int min;
-      int max;
-      int allocs;
-    };
-
-    Track_res alloc_tracker(Track action = Track::get) const noexcept {
-      if constexpr (Track_allocs) {
-          static Track_res tr {0,0,0,0,0};
-          if (action == Track::start) {
-
-            tr.allocs++;
-
-            if (tr.last < tr.min or tr.min == 0)
-              tr.min = tr.last;
-
-            if (tr.last > tr.max)
-              tr.max = tr.last;
-
-            tr.total += tr.last;
-            tr.last  = 0;
-
-          } else if (action == Track::inc){
-            tr.last++;
-          }
-          return tr;
-        }
-      return {};
-    }
-
-    void* allocate(Size_t size) noexcept {
-#ifdef INCLUDEOS_SMP_ENABLE
-      std::lock_guard<Spinlock> guard(pmr_lock);
-#endif
-
-      Expects(start_addr_);
-
-      auto node = root();
-
-      auto sz = chunksize(size);
-      if (not sz) return 0;
-
-      // Start allocation tracker
-      alloc_tracker(Track::start);
-
-      auto res = node.allocate(sz);
-
-      // For overbooking allocator, allow unusable memory to gradually become
-      // marked as allocated, without actually handing it out.
-      if (UNLIKELY(res + size > addr_limit_)) {
-        overbooked_ = true;
-        return 0;
-      }
-
-      if (res) bytes_used_ += sz;
-      return reinterpret_cast<void*>(res);
-    }
-
-    void deallocate(void* addr, Size_t size) {
-#ifdef INCLUDEOS_SMP_ENABLE
-      std::lock_guard<Spinlock> guard(pmr_lock);
-#endif
-      auto sz = size ? chunksize(size) : 0;
-      Expects(reinterpret_cast<uintptr_t>(addr) + size < addr_limit_);
-      auto res = root().deallocate((Addr_t)addr, sz);
-      Expects(not size or res == sz);
-      bytes_used_ -= res;
-    }
-
-    void* do_allocate(std::size_t bytes, std::size_t alignment)  override {
-      using namespace util;
-      auto aligned_size = bits::roundto(alignment, bytes);
-      return allocate(aligned_size);
-    }
-
-    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
-      using namespace util;
-      deallocate(p, bits::roundto(alignment, bytes));
-    }
-
-    bool do_is_equal(const memory_resource& other) const noexcept override {
-#ifdef INCLUDEOS_SMP_ENABLE
-      std::lock_guard<Spinlock> guard(pmr_lock);
-#endif
-      return &other == this;
-    }
-
-    void free(void* addr) {
-      deallocate(addr, 0);
-    }
-
-
-    //private:
-    class Node_view {
-    public:
-
-      Node_view(int index, const Alloc* alloc)
-        : i_{index}, alloc_{alloc},
-          my_size_{compute_size()}, my_addr_{compute_addr()}
-      {}
-
-      Node_view() = default;
-
-      Node_view empty() const noexcept {
-        return Node_view();
-      }
-
-      Node_view left() const noexcept {
-        if (is_leaf()) {
-          return empty();
-        }
-        return Node_view(i_ * 2 + 1, alloc_);
-      }
-
-      Node_view right() const noexcept {
-        if (is_leaf()) {
-          return empty();
-        }
-        return Node_view(i_ * 2 + 2, alloc_);
-      }
-
-      Addr_t addr() const noexcept {
-        return my_addr_;
-      }
-
-      Size_t size() const noexcept {
-        return my_size_;
-      }
-
-      bool is_leaf() const noexcept {
-        Expects(alloc_->nodes_.size() / 2 <= std::numeric_limits<int>::max());
-        return i_ >= static_cast<int>(alloc_->nodes_.size() / 2);
-      }
-
-      bool is_taken() const noexcept {
-        return data() & Flags::taken;
-      }
-
-      bool is_free() const noexcept {
-        return data() == 0;
-      }
-
-      bool is_full() const noexcept {
-        auto fl = data();
-        return fl & Flags::taken or
-          (fl & Flags::left_full and fl & Flags::right_full);
-      }
-
-      bool in_range(Addr_t a) const noexcept {
-        return a >= my_addr_ and a < my_addr_ + my_size_;
-      }
-
-      void set_flag(Flags f) {
-        data() |= f;
-      }
-
-      void clear_flag(Flags f) {
-        data() &= ~f;
-      }
-
-      bool is_parent() const noexcept {
-        return i_ <= alloc_->leaf0();
-      }
-
-
-      bool is_full_r() const noexcept {
-        if (is_taken())
-          return true;
-        return is_parent() and left().is_full_r()
-          and is_parent() and right().is_full_r();
-      }
-
-      bool is_free_r() const noexcept {
-        auto lfree = not is_parent() or left().is_free_r();
-        auto rfree = not is_parent() or right().is_free_r();
-        return not is_taken() and lfree and rfree;
-      }
-
-
-      int height() const noexcept {
-        return (util::bits::fls(i_ + 1));
-      }
-
-      Size_t compute_size() const noexcept {
-        return min_size << (alloc_->tree_height() - height());
-      }
-
-      Addr_t compute_addr() const noexcept {
-        auto first_lvl_idx = 1 << (height() - 1);
-        auto sz_offs = i_ - first_lvl_idx + 1;
-        return alloc_->start_addr_ + (sz_offs * my_size_);
-      }
-
-      operator bool() const noexcept {
-        return alloc_->start_addr_ != 0 and alloc_ != nullptr;
-      }
-
-      Node_t& data() {
-        return alloc_->nodes_[i_]; // Was .at(i_), TODO with c++26
-      }
-
-      const Node_t& data() const noexcept {
-        return alloc_->nodes_[i_]; // TODO c++26, .at(i_);
-      }
-
-      Addr_t allocate_self() {
-        Expects(not (data() & Flags::taken));
-        set_flag(Flags::taken);
-        return my_addr_;
-      }
-
-      Addr_t allocate(Size_t sz) {
-        using namespace util;
-
-        // Track allocation steps
-        alloc_->alloc_tracker(Track::inc);
-
-        Expects(sz <= my_size_);
-        Expects(! is_taken());
-
-        // Allocate self if possible
-        if (sz == my_size_) {
-          if (is_free()) {
-            return allocate_self();
-          }
-          return 0;
-        }
-
-        if (not is_parent())
-          return 0;
-
-        // Try left allocation
-        auto lhs = left();
-        if (not lhs.is_full()) {
-
-          auto addr_l = lhs.allocate(sz);
-
-          if (lhs.is_full())
-            set_flag(Flags::left_full);
-
-          if (addr_l) {
-            set_flag(Flags::left_used);
-            return addr_l;
-          }
-        }
-
-        // Try right allocation
-        auto rhs = right();
-        if (not rhs.is_full()) {
-
-          auto addr_r = rhs.allocate(sz);
-
-          if (rhs.is_full())
-            set_flag(Flags::right_full);
-
-          if (addr_r != 0) {
-            set_flag(Flags::right_used);
-            return addr_r;
-          }
-        }
-
-        return 0;
-      }
-
-      // Left / right deallocation
-      // TODO: there must be a pattern to make this DRY in a nice way
-      //       also for the left / right allocation steps above.
-
-      Size_t dealloc_left(Addr_t ptr, Size_t sz) {
-        auto lhs = left();
-        auto res = lhs.deallocate(ptr, sz);
-        if (not lhs.is_full()) {
-          clear_flag(Flags::left_full);
-        }
-        if (lhs.is_free()) {
-          clear_flag(Flags::left_used);
-        }
-        return res;
-      }
-
-      Size_t dealloc_right(Addr_t ptr, Size_t sz) {
-        auto rhs = right();
-        auto res = rhs.deallocate(ptr, sz);
-        if (not rhs.is_full()){
-          clear_flag(Flags::right_full);
-        }
-        if (rhs.is_free()) {
-          clear_flag(Flags::right_used);
-        }
-        return res;
-      }
-
-      Size_t dealloc_self() {
-        data() = 0;
-        return my_size_;
-      }
-
-      bool is_left(Addr_t ptr) const noexcept {
-        return ptr < my_addr_ + my_size_ / 2;
-      }
-
-      bool is_right(Addr_t ptr) const noexcept {
-        return ptr >= my_addr_ + my_size_ / 2;
-      }
-
-      Addr_t deallocate(Addr_t ptr, Size_t sz = 0) {
-        using namespace util;
-
-        #ifdef DEBUG_UNIT
-        printf("Node %i DE-allocating 0x%zx size %zi \n", i_, ptr, sz);
-        #endif
-
-        Expects(not (is_taken() and (data() & Flags::left_used
-                                     or data() & Flags::right_used)));
-
-
-        // Don't try if ptr is outside range
-        if (not in_range(ptr)) {
-          return 0;
-        }
-
-        if (is_taken()) {
-          if (ptr != my_addr_)
-            return 0;
-
-          if (sz)
-            Expects(my_size_ == sz);
-
-          return dealloc_self();
-        }
-
-        if (not is_parent()) {
-          return 0;
-        }
-
-        if (is_left(ptr)) {
-          return dealloc_left(ptr, sz);
-        }
-
-        if (is_right(ptr)) {
-          return dealloc_right(ptr, sz);
-        }
-
-        return 0;
-      }
-
-      Size_t bytes_used_r() const noexcept {
-        if (is_taken())
-          return my_size_;
-
-        if (is_parent())
-          return left().bytes_used_r() + right().bytes_used_r();
-
-        return 0;
-      }
-
-      Addr_t highest_used_r() const noexcept {
-        if (is_free()) {
-          return my_addr_;
-        }
-
-        if (is_taken() or not is_parent()) {
-          return my_addr_ + my_size_;
-        }
-
-        auto right_ = right();
-        if (not right_.is_free()) {
-          return right_.highest_used_r();
-        }
-
-        auto left_ = left();
-        Expects(not left_.is_free());
-        return left_.highest_used_r();
-      }
-
-      std::string to_string() const  {
-        std::stringstream out;
-        out << std::hex
-            <<  (int)data()
-            << std::dec;
-        return out.str();
-      }
-
-    private:
-      int i_ = 0;
-      const Alloc* alloc_  = nullptr;
-      Size_t my_size_ = 0;
-      Addr_t my_addr_ = 0;
-    };
-
-    Node_view root() {
-      return Node_view(0, this);
-    }
-
-    const Node_view root() const {
-      return Node_view(0, this);
-    }
-
-    std::string summary() const {
-      std::stringstream out;
-      std::string dashes(80, '-');
-      out << dashes << "\n";
-      out << "Bytes used: " << util::Byte_r(bytes_used())
-          << ", Bytes free: " << util::Byte_r(bytes_free())
-          << " H: " << std::dec << tree_height()
-          << " W: " << tree_width()
-          << " Tree size: " << util::Byte_r(nodes_.size()) << "\n"
-          << "Address pool: 0x" << std::hex
-          << root().addr() << " - " << root().addr() + pool_size_
-          << std::dec << " ( " << util::Byte_r(pool_size()) <<" ) \n";
-      auto track = alloc_tracker();
-      out << "Allocations:  " << track.allocs
-          << " Steps: Last: " << track.last
-          << " Min:  " << track.min
-          << " Max:  " << track.max
-          << " Total: " << track.total
-          << " Avg: " << track.total / track.allocs
-          << "\n";
-      out << dashes << "\n";
-      return out.str();
-    }
-    std::string draw_tree(bool index = false) const {
-      auto node_pr_w = index ? 6 : 4;
-      auto line_w = tree_width() * node_pr_w;
-
-      std::stringstream out{summary()};
-      std::string spaces (line_w, ' ');
-      std::string dashes (line_w, '-');
-
-      int i = 0;
-
-      for (int h = 0; h < tree_height(); h++) {
-        auto cnt = 1 << h;
-        auto prw = cnt * node_pr_w;
-        int loff  = (spaces.size() / 2) - (prw / 2);
-        // Line offset
-        auto nsize = min_size << (tree_height() - h - 1);
-        printf("%s\t", util::Byte_r(nsize).to_string().c_str());
-        printf("%.*s",  loff, spaces.c_str());
-        out.flush();
-        while (cnt--) {
-          printf("[%s] ",  Node_view(i, this).to_string().c_str());
-          i++;
-        }
-        printf("\n");
-      }
-      out << dashes << "\n";
-      return out.str();
-    }
-
-    //using Tracker = typename std::enable_if<Track_allocs, Track_res>::type;
-    Track_res tr {0,0,0,0,0}; // If tracking enabled
-
-    Node_arr nodes_;
-    const uintptr_t start_addr_ = 0;
-    const uintptr_t addr_limit_ = 0;
-    const Size_t pool_size_ = min_size;
-    Size_t bytes_used_ = 0;
-    bool overbooked_ = false;
-  };
-
-}
-
-#endif
+    return false;
+  }
+};
+
+} // namespace os::mem
