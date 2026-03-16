@@ -77,69 +77,98 @@ uintptr_t mmap_allocation_end() {
   return default_allocator->highest_used();
 }
 
-static void* sys_mmap(void * addr, size_t length, int /*prot*/, int flags,
-                      int fd, off_t /*offset*/)
+static void* mmap_failed(int err) {
+  errno = err;
+  return MAP_FAILED;
+}
+
+using Fd = std::optional<int>;
+
+static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os::mem::alloc::Flags flags, Fd file_descriptor, off_t offset)
 {
+  using os::mem::alloc::Flags;
 
-  // TODO: Implement minimal functionality to be POSIX compliant
-  // https://pubs.opengroup.org/onlinepubs/009695399/functions/mmap.html
-  if (length <= 0) {
-    Expectsf(false, "Must always allocate at least 1 byte. Got {}", length);
-    errno = EINVAL;
-    return MAP_FAILED;
+  if (util::has_flag(flags, Flags::Private) ==
+      util::has_flag(flags, Flags::Shared))
+  {
+    Expects(false && "Mapping must be either Private xor Shared");
+    return mmap_failed(EINVAL);
   }
 
-  if (fd > -1) {
-    // None of our file systems support memory mapping at the moment
-    Expects(false && "Mapping to file descriptor not supported");
-    errno = ENODEV;
-    return MAP_FAILED;
+  if (length == 0) {
+    Expects(false && "Mapping must never allocate 0 bytes");
+    return mmap_failed(EINVAL);
   }
 
-  if ((flags & MAP_ANONYMOUS) == 0) {
-    Expects(false && "We only support MAP_ANONYMOUS calls to mmap()");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  if (util::has_flag(flags, Flags::Anonymous)) {
+    if (file_descriptor) {
+      Expects(false && "Anonymous mappings must set fd=-1");
+      return mmap_failed(EINVAL);
+    }
+    if (offset != 0) {
+      Expects(false && "Anonymous mappings should have offset=0");
+      return mmap_failed(EINVAL);
+    }
   }
 
-  if ((flags & MAP_FIXED) > 0) {
-    Expects(false && "MAP_FIXED not supported.");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  // non-fixed address is only a hint for now, so ignore it
+  if (addr != 0 &&
+      util::missing_flag(flags, Flags::FixedFriendly) &&
+      util::missing_flag(flags, Flags::FixedOverride))
+  {
+    addr = 0;
   }
 
-  if (((flags & MAP_PRIVATE) > 0) && ((flags & MAP_ANONYMOUS) == 0)) {
-    Expects(false && "MAP_PRIVATE only supported for MAP_ANONYMOUS");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  if (file_descriptor) {
+    Expects(false && "Mapping to file descriptor is not yet implemented");
+    return mmap_failed(ENOTSUP);
   }
 
-  if (((flags & MAP_PRIVATE) > 0) && (addr != 0)) {
-    Expects(false && "MAP_PRIVATE only supported for new allocations (address=0).");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  if (util::missing_flag(flags, Flags::Anonymous)) {
+    Expects(false && "Support for non-anonymous mappings is not yet implemented");
+    return mmap_failed(ENOTSUP);
   }
 
-  if (((flags & MAP_SHARED) == 0) && ((flags & MAP_PRIVATE) == 0)) {
-    Expects(false && "MAP_SHARED or MAP_PRIVATE must be set.");
-    errno = ENOTSUP;
-    return MAP_FAILED;
+  void* res = nullptr;
+
+  if (util::has_flag(flags, Flags::FixedFriendly) ||
+      util::has_flag(flags, Flags::FixedOverride))
+  {
+    Expects(false && "Support for MAP_FIXED is not yet implemented");
+    return mmap_failed(ENOTSUP);
   }
+  else {
+    if (util::has_flag(flags, Flags::Private)) {
+      if (util::missing_flag(flags, Flags::Anonymous)) {
+        Expects(false && "Support for MAP_PRIVATE other than MAP_ANONYMOUS is not yet implemented");
+        return mmap_failed(ENOTSUP);
+      }
 
-  // If we get here, the following should be true:
-  // MAP_ANONYMOUS set + MAP_SHARED or MAP_PRIVATE
-  // fd should be 0, address should be 0 for MAP_PRIVATE
-  // (address is in any case ignored)
+      if (addr != 0) {
+        Expects(false && "Support for MAP_PRIVATE with non-zero hint address is not yet implemented");
+        return mmap_failed(ENOTSUP);
+      }
 
-  auto* res = kalloc(length);
+      res = kalloc(length);
+    }
+  }
 
   if (UNLIKELY(res == nullptr)) {
-    errno = ENOMEM;
-    return MAP_FAILED;
+    return mmap_failed(ENOMEM);
   }
 
-  memset(res, 0, length);
+  // std::memset(res, 0, length);
   return res;
+}
+
+static void* sys_mmap(void* _addr, size_t length, int _prot, int _flags, int _fd, off_t offset)
+{
+  const auto flags = static_cast<os::mem::alloc::Flags>(_flags);
+  const auto prot  = static_cast<os::mem::Access>(_prot);
+  const Fd file_descriptor = (_fd == -1) ? std::nullopt : Fd(_fd);
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(_addr);
+
+  return __sys_mmap(addr, length, prot, flags, file_descriptor, offset);
 }
 
 extern "C"
