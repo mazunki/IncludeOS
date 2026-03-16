@@ -116,14 +116,16 @@ public:
 
 
   size_t bytes_used() const noexcept override {
-    return 0;
-  };
+    return busy_bytes_;
+  }
+
   size_t bytes_free() const noexcept override {
-    return 0;
-  };
+    return pool_size_ - busy_bytes_;
+  }
+
   uintptr_t highest_used() const noexcept override {
-    return 0;
-  };
+    return peak_highest_used_;
+  }
 
 protected:
   std::string_view name() const noexcept override { return "buddy"; }
@@ -157,8 +159,17 @@ protected:
       // split into [addr, addr+2^have) and [addr+2^have, addr+2^(have+1))
       const std::uintptr_t right = addr + (std::uintptr_t(1) << have);
       push_free(right, have);
+    }
 
-      // keep left half as addr
+    /* tracing metainfo */
+    {
+      const std::size_t reserved = std::size_t(1) << want;
+      busy_bytes_ += reserved;
+      peak_busy_bytes_ = std::max(peak_busy_bytes_, busy_bytes_);
+
+      const std::uintptr_t end = addr + reserved;
+      highest_used_ = std::max(highest_used_, end);
+      peak_highest_used_ = std::max(peak_highest_used_, end);
     }
 
     return addr;
@@ -177,6 +188,16 @@ protected:
     if (order > max_order_) {
       // the caller tried to deallocate something bigger than us... this is bad!
       return;
+    }
+
+    /* tracing metainfo */
+    {
+      const std::size_t reserved = std::size_t(1) << order;
+      if (busy_bytes_ >= reserved) {
+        busy_bytes_ -= reserved;
+      } else {
+        busy_bytes_ = 0;
+      }
     }
 
     // merge while buddy is free at same order
@@ -231,6 +252,19 @@ protected:
     if (!remove_if_free(addr, order)) {
       throw std::bad_alloc();  // unable to take ownership of the node at this position
     }
+
+    /* tracing metainfo */
+    {
+      // TODO: fix tracing to not double count overriden data
+      const std::size_t reserved = std::size_t(1) << order;
+      busy_bytes_ += reserved;
+      peak_busy_bytes_ = std::max(peak_busy_bytes_, busy_bytes_);
+
+      const std::uintptr_t end = addr + reserved;
+      highest_used_ = std::max(highest_used_, end);
+      peak_highest_used_ = std::max(peak_highest_used_, end);
+    }
+
     return addr;
   }
 
@@ -245,11 +279,16 @@ private:
   std::uintptr_t pool_end_{0};
   std::size_t    pool_size_{0};
 
-  int min_order_{0};  // represents the order for the biggest bud available
-  int max_order_{0};  // represents the order for the tiniest bud available
+  int min_order_{0};  // represents the order for the tiniest bud available
+  int max_order_{0};  // represents the order for the biggest bud available
   std::size_t orders_{0};  // max-min, i.e. how many valid orders. used for freelist
 
   FreeNode** free_{nullptr};
+
+  std::size_t busy_bytes_{0};
+  std::size_t peak_busy_bytes_{0};
+  std::uintptr_t highest_used_{0};
+  std::uintptr_t peak_highest_used_{0};
 
   static std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment) noexcept {
     const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
