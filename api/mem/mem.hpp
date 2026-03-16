@@ -120,7 +120,7 @@ private:
       throw std::invalid_argument("alignment must be a power of 2");
 
     // pre: validate overbooking
-    if (!config_.overbooking && stats_.requested_bytes + bytes > stats_.total_bytes) {
+    if (!config_.overbooking && stats_.busy_bytes + bytes > stats_.total_bytes) {
         // HACK: using requested bytes here is wrong, just a temporary workaround
         // if (!config_.overbooking && stats_.busy_bytes + bytes > stats_.total_bytes)
         throw std::bad_alloc();
