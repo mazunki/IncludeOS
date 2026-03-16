@@ -61,6 +61,13 @@ void* kalloc_aligned(size_t alignment, size_t size) {
 }
 
 extern "C" __attribute__((weak))
+void* kalloc_fixed(void* addr, size_t size, bool override)
+{
+  Expects(kernel::heap_ready());
+  return default_allocator->allocate_at(addr, size, override);
+}
+
+extern "C" __attribute__((weak))
 void kfree (void* ptr, size_t size) {
   default_allocator->deallocate(ptr, size);
 }
@@ -134,8 +141,20 @@ static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os:
   if (util::has_flag(flags, Flags::FixedFriendly) ||
       util::has_flag(flags, Flags::FixedOverride))
   {
-    Expects(false && "Support for MAP_FIXED is not yet implemented");
-    return mmap_failed(ENOTSUP);
+    const size_t page_sz = PAGE_SIZE;
+    const size_t len_rounded = util::bits::roundto(page_sz, length);
+
+    if (addr == 0) {
+      return mmap_failed(EINVAL);
+    }
+
+    if (!util::bits::is_aligned(page_sz, addr)) {
+      return mmap_failed(EINVAL);
+    }
+
+    const bool do_override = util::has_flag(flags, Flags::FixedOverride);
+
+    res = kalloc_fixed(reinterpret_cast<void*>(addr), len_rounded, do_override);
   }
   else {
     if (util::has_flag(flags, Flags::Private)) {
