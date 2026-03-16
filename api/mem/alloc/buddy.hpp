@@ -154,13 +154,7 @@ protected:
 
     // pop a block of order 'have' and split down to 'want'
     std::uintptr_t addr = pop_free(have);
-
-    while (have > want) {
-      --have;
-      // split into [addr, addr+2^have) and [addr+2^have, addr+2^(have+1))
-      const std::uintptr_t right = addr + (std::uintptr_t(1) << have);
-      push_free(right, have);
-    }
+    addr = split_left(addr, have, want);
 
     /* tracing metainfo */
     {
@@ -250,8 +244,12 @@ protected:
       throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: address is not aligned");
     }
 
-    if (!remove_if_free(addr, order)) {
-      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: no free block contains requested address");
+    std::uintptr_t base = 0;
+    int have = order;
+    if (!permit_override) {
+      if (!block_is_free(addr, order, base, have)) {
+        throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: no free block contains requested address");
+      }
     }
 
     /* tracing metainfo */
@@ -361,6 +359,56 @@ private:
         return true;
       }
       cur = &((*cur)->next);
+    }
+    return false;
+  }
+
+  std::uintptr_t split_left(std::uintptr_t addr, int have, int want) noexcept {
+    while (have > want) {
+      --have;
+      // split into [addr, addr+2^have) and [addr+2^have, addr+2^(have+1))
+      const std::uintptr_t right = addr + (std::uintptr_t(1) << have);
+      push_free(right, have);
+
+      // keep left half as addr
+    }
+    return addr;
+  }
+
+  /* keep dividing down a bud until the desired address is adequatly split into buds */
+  std::uintptr_t split_towards(std::uintptr_t base, int have, int want, std::uintptr_t target) noexcept {
+    while (have > want) {
+      --have;
+      const std::uintptr_t half = (std::uintptr_t(1) << have);
+      const std::uintptr_t right = base + half;
+
+      if (target < right) {
+        push_free(right, have);
+      } else {
+        push_free(base, have);
+        base = right;
+      }
+    }
+    return base;
+  }
+
+  /* check if there is some free block that contains the requested target address */
+  bool block_is_free(std::uintptr_t target, int want, std::uintptr_t& base, int& have) noexcept {
+    for (have = want; have <= max_order_; ++have) {
+      FreeNode** cur = &free_[idx(have)];
+      while (*cur) {
+        const auto candidate = reinterpret_cast<std::uintptr_t>(*cur);
+        const auto size = (std::uintptr_t(1) << have);
+
+        if (target >= candidate && target < candidate + size) {
+          FreeNode* hit = *cur;
+          *cur = hit->next;
+          base = candidate;
+          return true;
+        }
+
+        cur = &((*cur)->next);
+      }
     }
     return false;
   }
