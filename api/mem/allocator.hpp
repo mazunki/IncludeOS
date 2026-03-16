@@ -18,6 +18,7 @@
 #ifndef OS_ALLOCATOR_HPP
 #define OS_ALLOCATOR_HPP
 
+#include "mem/mem.hpp"
 #include <memory>
 
 namespace os::mem {
@@ -41,7 +42,7 @@ namespace os::mem {
     T* allocate(std::size_t size) {
       auto res = reinterpret_cast<T*>(resource.allocate(size * sizeof(T)));
       if (res == nullptr)
-        throw std::bad_alloc();
+        throw os::mem::allocator_error("os::mem::Allocator::allocate: got a nullptr");
       return res;
     }
 
