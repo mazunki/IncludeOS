@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <mem/mem.hpp>
+#include <mem/flags.hpp>
 #include <mem/alloc/buddy.hpp>
 #include <os>
 #include <kernel/memory.hpp>
@@ -12,11 +13,11 @@
 #include <cstring>
 
 static os::mem::buddy_resource* buddy_alloc = nullptr;
-static os::mem::mem_resource* alloc = nullptr;
+static os::mem::mem_resource* default_allocator = nullptr;
 
 os::mem::mem_resource& os::mem::raw_allocator() {
-  Expects(alloc);
-  return *alloc;
+  Expects(default_allocator);
+  return *default_allocator;
 }
 
 uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
@@ -42,7 +43,7 @@ uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
   };
 
   buddy_alloc = new (self) os::mem::buddy_resource(cfg, bcfg);
-  alloc = buddy_alloc;
+  default_allocator = buddy_alloc;
 
   return aligned_end;
 }
@@ -50,30 +51,30 @@ uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
 extern "C" __attribute__((weak))
 void* kalloc(size_t size) {
   Expects(kernel::heap_ready());
-  return alloc->allocate(size);
+  return default_allocator->allocate(size);
 }
 
 extern "C" __attribute__((weak))
 void* kalloc_aligned(size_t alignment, size_t size) {
   Expects(kernel::heap_ready());
-  return alloc->allocate(size, alignment);
+  return default_allocator->allocate(size, alignment);
 }
 
 extern "C" __attribute__((weak))
 void kfree (void* ptr, size_t size) {
-  alloc->deallocate(ptr, size);
+  default_allocator->deallocate(ptr, size);
 }
 
 size_t mmap_bytes_used() {
-  return alloc->bytes_used();
+  return default_allocator->bytes_used();
 }
 
 size_t mmap_bytes_free() {
-  return alloc->bytes_free();
+  return default_allocator->bytes_free();
 }
 
 uintptr_t mmap_allocation_end() {
-  return alloc->highest_used();
+  return default_allocator->highest_used();
 }
 
 static void* sys_mmap(void * addr, size_t length, int /*prot*/, int flags,
