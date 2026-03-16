@@ -46,13 +46,13 @@ public:
 
     resource_base_ = cfg_.region.start;
     if (resource_base_ >= cfg_.region.end) {
-      throw std::bad_alloc();
+      throw os::mem::allocator_error("os::mem::buddy_resource: allocator can't end before it starts");
     }
 
     const std::size_t total_avail = static_cast<std::size_t>(cfg_.region.end - resource_base_);
     const std::size_t provisional = std::bit_floor(total_avail);  // how many buds at max?
     if (provisional < bcfg_.min_block) {
-      throw std::bad_alloc();
+      throw os::mem::allocator_error("os::mem::buddy_resource: insufficient space for a minimum block (early check)");
     }
 
     // these are provisional because the freelist might offset them slightly
@@ -67,13 +67,13 @@ public:
     // the pool's (i.e. the colletion of buds) base starts after the buddy's metadata
     pool_base_ = align_up(resource_base_ + freelist_size, bcfg_.min_block);
     if (pool_base_ >= cfg_.region.end) {
-      throw std::bad_alloc();  // metadata took too much space
+      throw os::mem::allocator_error("os::mem::buddy_resource: insufficient space for pool metadata");
     }
 
     std::size_t avail = static_cast<std::size_t>(cfg_.region.end - pool_base_);
     pool_size_ = std::bit_floor(avail);
     if (pool_size_ < bcfg_.min_block) {
-      throw std::bad_alloc();  // can't even fit one bud in remaining space
+      throw os::mem::allocator_error("os::mem::buddy_resource: insufficient space for a minimum block");
     }
 
     min_order_ = order_for(0);
@@ -136,7 +136,8 @@ protected:
 
     const int want = order_for(aligned_bytes);
     if (want > max_order_) {
-      throw std::bad_alloc();  // our tree is not big enough
+      // std::println("buddy allocate failed: bytes={} alignment={} want={} max_order={}", bytes, alignment, want, max_order_);
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate: allocation size is always too large for allocator");
     }
 
     // find smallest available order >= want
@@ -146,7 +147,7 @@ protected:
     }
 
     if (have > max_order_) {
-      throw std::bad_alloc();  // couldn't find a free node of this size
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate: couldn't find a slot for the requested allocation. ran out of memory?");
     }
 
     // pop a block of order 'have' and split down to 'want'
@@ -214,22 +215,22 @@ protected:
     // TODO: permit overriding
 
     if (addr < pool_base_ || addr >= pool_end_) {
-      throw std::bad_alloc();  // we have no control over the address requested!
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: address is out of allocator range");
     }
 
     const std::size_t need = std::max(bytes, alignment);
     const int order = order_for(need);
     if (order > max_order_) {
-      throw std::bad_alloc();  // the requested size is too big to fit in our pool
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: allocation size is always too large");
     }
 
     const std::uintptr_t block_size = (std::uintptr_t(1) << order);
     if ( ((addr - pool_base_) & (block_size - 1)) != 0 ) {
-      throw std::bad_alloc();  // address isn't aligned to the requested size
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: address is not aligned");
     }
 
     if (!remove_if_free(addr, order)) {
-      throw std::bad_alloc();  // unable to take ownership of the node at this position
+      throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: no free block contains requested address");
     }
     return addr;
   }

@@ -37,6 +37,17 @@ struct mem_config {
   bool overbooking{false};
 };
 
+class allocator_error : public std::bad_alloc {
+public:
+    explicit allocator_error(const char* msg) : msg_(msg) {}
+
+    const char* what() const noexcept override {
+        return msg_;
+    }
+
+private:
+    const char* msg_;
+};
 
 class mem_resource : public std::pmr::memory_resource {
 public:
