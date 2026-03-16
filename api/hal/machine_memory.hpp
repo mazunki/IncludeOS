@@ -56,7 +56,7 @@ namespace os {
     T* allocate(std::size_t size) {
       auto res = reinterpret_cast<T*>(resource.allocate(size * sizeof(T)));
       if (res == nullptr)
-        throw std::bad_alloc();
+        throw os::mem::allocator_error("os::Machine::Allocator::allocate: allocation returned a nullptr");
       return res;
     }
 

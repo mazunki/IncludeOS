@@ -16,6 +16,7 @@
 
 #ifndef UTIL_ALLOC_PMR
 #define UTIL_ALLOC_PMR
+#include "mem/mem.hpp"
 #if __has_include(<memory_resource>)
 #include <memory_resource>
 #include <vector> // For pmr::vector
@@ -107,7 +108,7 @@ namespace os::mem {
     void* do_allocate(std::size_t size, std::size_t align) override {
       auto* res = aligned_alloc(align, size);
       if (res == nullptr)
-        throw std::bad_alloc();
+        throw os::mem::allocator_error("os::mem::Pmr_resource::do_allocate: got a nullptr");
       return res;
     }
 
