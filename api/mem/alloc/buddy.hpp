@@ -202,7 +202,7 @@ protected:
     push_free(addr, order);
   }
 
-  std::uintptr_t strat_allocate_at(std::uintptr_t addr, std::size_t bytes, std::size_t alignment) override {
+  std::uintptr_t strat_allocate_at(std::uintptr_t addr, std::size_t bytes, std::size_t alignment, bool permit_override) override {
     // mem_resource already validated:
     // - addr is aligned to 'alignment'
     // - addr is within [region.start, region.end)
