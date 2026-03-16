@@ -18,6 +18,7 @@
 //#define DEBUG // Enable debugging
 //#define DEBUG2
 
+#include "mem/mem.hpp"
 #include <kernel/elf.hpp>
 #include <util/fixed_vector.hpp>
 #include <common>
@@ -130,7 +131,7 @@ void* operator new (std::size_t len)
   if (UNLIKELY(!data)) {
       print_backtrace();
       DPRINTF("malloc(%llu bytes): FAILED\n", (unsigned long long) len);
-      throw std::bad_alloc();
+      throw os::mem::allocator_error("heap_debugging.cpp: operator new: malloc return an invalid pointer");
   }
 
   if (enable_debugging) {

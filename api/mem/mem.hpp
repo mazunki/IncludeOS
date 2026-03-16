@@ -37,6 +37,17 @@ struct mem_config {
   bool overbooking{false};
 };
 
+class allocator_error : public std::bad_alloc {
+public:
+    explicit allocator_error(const char* msg) : msg_(msg) {}
+
+    const char* what() const noexcept override {
+        return msg_;
+    }
+
+private:
+    const char* msg_;
+};
 
 class mem_resource : public std::pmr::memory_resource {
 public:
@@ -63,8 +74,8 @@ public:
    * this interface does not provide allocate_at(), which is necessary for
    * MAP_FIXED allocations
    */
-  void* allocate_at(void* where, std::size_t bytes, std::size_t alignment=alignof(std::max_align_t)) {
-    return do_allocate_at(where, bytes, alignment);
+  void* allocate_at(void* where, std::size_t bytes, bool permit_override, std::size_t alignment=alignof(std::max_align_t)) {
+    return do_allocate_at(where, bytes, alignment, permit_override);
   }
 
   virtual size_t bytes_used() const noexcept = 0;
@@ -78,12 +89,13 @@ protected:
   virtual uintptr_t strat_allocate(std::size_t bytes, std::size_t alignment) = 0;
   virtual void  strat_deallocate(uintptr_t p, std::size_t bytes, std::size_t alignment) noexcept = 0;
 
-  virtual uintptr_t strat_allocate_at(uintptr_t where, std::size_t bytes, std::size_t alignment) {
+  virtual uintptr_t strat_allocate_at(uintptr_t where, std::size_t bytes, std::size_t alignment, bool permit_override) {
     /*
      * the default implementation explicitly ignores the requested position in order
      * to make it easier to implement different strategies
      **/
     (void)where;
+    (void) permit_override;
     return strat_allocate(bytes, alignment);
   }
 
@@ -108,7 +120,7 @@ private:
       throw std::invalid_argument("alignment must be a power of 2");
 
     // pre: validate overbooking
-    if (!config_.overbooking && stats_.requested_bytes + bytes > stats_.total_bytes) {
+    if (!config_.overbooking && stats_.busy_bytes + bytes > stats_.total_bytes) {
         // HACK: using requested bytes here is wrong, just a temporary workaround
         // if (!config_.overbooking && stats_.busy_bytes + bytes > stats_.total_bytes)
         throw std::bad_alloc();
@@ -126,7 +138,7 @@ private:
     return reinterpret_cast<void*>(p);
   }
 
-  void* do_allocate_at(void* where, std::size_t bytes, std::size_t alignment) {  // not final since it's not a virtual: can't be overriden anyway
+  void* do_allocate_at(void* where, std::size_t bytes, std::size_t alignment, bool permit_override) {  // not final since it's not a virtual: can't be overriden anyway
     auto addr = reinterpret_cast<std::uintptr_t>(where);
 
     // pre: validate alignment
@@ -139,9 +151,9 @@ private:
     if (addr < config_.region.start || addr >= config_.region.end)
       throw std::invalid_argument("address must be in range");
     if (bytes > config_.region.end - addr)
-      throw std::bad_alloc();  // allocation won't fit in memory
+      throw os::mem::allocator_error("os::mem::mem_resource:do_allocate_at: allocation won't fit at requested address");
 
-    uintptr_t p = strat_allocate_at(reinterpret_cast<uintptr_t>(where), bytes, alignment);
+    uintptr_t p = strat_allocate_at(reinterpret_cast<uintptr_t>(where), bytes, alignment, permit_override);
 
     // post: update stats
     stats_.requested_bytes += bytes;

@@ -17,6 +17,7 @@
 #ifndef UTIL_DETAIL_ALLOC_PMR
 #define UTIL_DETAIL_ALLOC_PMR
 
+#include "mem/mem.hpp"
 #include <deque>
 #include <delegate>
 #include <expects>
@@ -36,14 +37,14 @@ namespace os::mem::detail {
     void* do_allocate(size_t size, size_t align) override {
       if (UNLIKELY(size + allocated_ > cap_total_)) {
         //printf("pmr about to throw bad alloc: sz=%zu alloc=%zu cap=%zu align=%zu\n", size, allocated_, cap_total_, align);
-        throw std::bad_alloc();
+        throw os::mem::allocator_error("os::mem::detail::Pmr_pool::do_allocate: allocation would bypass the pool's cap");
       }
 
       void* buf = aligned_alloc(align, size);
 
       if (buf == nullptr) {
         //printf("pmr aligned_alloc return nullptr, throw bad alloc\n");
-        throw std::bad_alloc();
+        throw os::mem::allocator_error("os::mem::detail::Pmr_pool::do_allocate: allocation returned a nullptr");
       }
 
       allocated_ += size;
@@ -261,7 +262,7 @@ namespace os::mem {
     auto cap = capacity();
 
     if (UNLIKELY(size + used > cap)) {
-      throw std::bad_alloc();
+        throw os::mem::allocator_error("os::mem::detail::Pmr_resource::do_allocate: allocation would bypass the pool's cap");
     }
 
     void* buf = pool_->allocate(size, align);
