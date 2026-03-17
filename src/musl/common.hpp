@@ -74,6 +74,7 @@ template<typename Fn, typename ...Args>
 inline auto strace(Fn func, [[maybe_unused]]const char* name, Args&&... args) {
   if (!kernel::state().allow_syscalls) {
     fprintf(stderr, "Syscalls not allowed here. Unexpected call to %s - terminating\n", name);
+    os::halt();
     Expects(kernel::state().allow_syscalls);
   }
 
