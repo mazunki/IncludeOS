@@ -376,6 +376,8 @@ uintptr_t mem::active_page_size(uintptr_t addr){
 
 void allow_executable()
 {
+  // FIXME: this seems weird. is this only used for tests?
+
   INFO2("* Allowing execute on %p -> %p",
         (void*) __exec_begin, (void*)__exec_end);
 
@@ -391,7 +393,7 @@ void allow_executable()
   m.page_sizes = os::mem::Map::any_size;
   m.flags      = os::mem::Access::execute | os::mem::Access::read;
 
-  os::mem::map(m, "ELF .text");
+  os::mem::map(m, "Executable");
 }
 
 /* TODO: Compiler warning unused
