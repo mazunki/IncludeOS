@@ -1,9 +1,13 @@
+#include "kernel/memory.hpp"
 #include <os>
 #include <service>
 
 void Service::start(const std::string& args){
-  printf("Args = %s\n", args.c_str());
-  printf("Try giving the service less memory, eg. 10MB in vm.json\n");
+  std::println("Virtual mappings:");
+  for (const auto& entry : os::mem::vmmap())
+      std::println(" {}", entry.second.to_string());
+
   printf("Service done. Shutting down...\n");
+
   os::shutdown();
 }
