@@ -19,6 +19,7 @@
 #ifndef UTIL_BITOPS_HPP
 #define UTIL_BITOPS_HPP
 
+#include "expects"
 #include <type_traits>
 #include <cstdint>
 
@@ -243,6 +244,16 @@ inline constexpr uintptr_t roundto(uintptr_t M, uintptr_t x)
 
 inline constexpr uintptr_t align(uintptr_t M, uintptr_t x)
 { return roundto(M, x); }
+
+inline constexpr uintptr_t align_up(uintptr_t x, uintptr_t alignment) noexcept {
+  Expects(is_pow2(alignment));
+  return (x + alignment - 1) & ~(alignment - 1);
+}
+
+inline constexpr uintptr_t align_down(uintptr_t x, uintptr_t alignment) noexcept {
+  Expects(is_pow2(alignment));
+  return x & ~(alignment - 1);
+}
 
 // Determine if ptr is A-aligned
 template <uintptr_t A>

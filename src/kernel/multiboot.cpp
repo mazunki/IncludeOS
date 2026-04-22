@@ -204,7 +204,7 @@ void kernel::multiboot(uint32_t boot_addr)
         continue;
       }
 
-      os::mem::Map rw_map = { /*.linear=*/start, /*.physical=*/start, /*.fl=*/os::mem::Access::read | os::mem::Access::write, /*.sz=*/size };
+      os::mem::Map rw_map = { /*.linear=*/start, /*.physical=*/start, /*.fl=*/os::mem::Permission::Data, /*.sz=*/size };
       switch (map.type)
       {
         case MULTIBOOT_MEMORY_ACPI_RECLAIMABLE:

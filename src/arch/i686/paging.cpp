@@ -25,14 +25,28 @@ void __arch_init_paging()
   INFO("x86", "Paging not enabled by default on 32-bit");
 }
 
-namespace os {
-namespace mem {
+namespace os::mem {
   __attribute__((weak))
   Map map(Map m, const char* name) {  // FIXME: use params, remove or mark unused
     return {};
   }
 
-  template <>
-  const size_t Mapping<os::mem::Access>::any_size = 4096;
-}
+  Map protect(virt_addr_t linear, mem_size_t len, Permission flags)
+  {
+    return {};
+  }
+
+  Map protect_existing(virt_addr_t linear, mem_size_t len, Permission flags)
+  {
+    return {};
+  }
+
+  Permission permissions(virt_addr_t)
+  {
+    return Permission::Open;  // permissive lie
+  }
+
+  page_sizes_t supported_page_sizes() {
+    return page_sizes_t{4096};
+  }
 }

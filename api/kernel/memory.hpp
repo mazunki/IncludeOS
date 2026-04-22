@@ -19,14 +19,232 @@
 #ifndef KERNEL_MEMORY_HPP
 #define KERNEL_MEMORY_HPP
 
+#include "util/pretty.hpp"
 #include <util/bitops.hpp>
 #include <util/units.hpp>
 #include <mem/alloc/buddy.hpp>
 #include <mem/allocator.hpp>
 #include <mem/flags.hpp>
+#include <mem/types.hpp>
 #include <sstream>
 #include <expects>
 #include <kernel/memmap.hpp>
+#include <fmt/format.h>
+#include <fmt/std.h>
+
+
+namespace os::mem {
+  struct page_sizes_t {
+    uintptr_t mask = 0; // bitmask of allowed page sizes
+
+    constexpr bool empty() const {
+      return mask == 0;
+    }
+
+    constexpr bool some() const {
+      return mask != 0;
+    }
+
+    constexpr bool intersects(page_sizes_t rhs) const {
+      return (mask & rhs.mask) != 0;
+    }
+
+    constexpr bool contains(types::page_size_t ps) const {
+      return (mask & ps.bytes()) != 0;
+    }
+
+    constexpr types::page_size_t min() const {
+      return static_cast<types::page_size_t>(util::bits::keepfirst(mask));
+    }
+
+    constexpr types::page_size_t max() const {
+      return static_cast<types::page_size_t>(util::bits::keeplast(mask));
+    }
+
+    constexpr bool operator==(const page_sizes_t&) const noexcept = default;
+    constexpr bool operator!=(const page_sizes_t&) const noexcept = default;
+
+    constexpr page_sizes_t operator|(page_sizes_t rhs) const {
+      return { mask | rhs.mask };
+    }
+
+    constexpr page_sizes_t& operator|=(page_sizes_t rhs) {
+      mask |= rhs.mask;
+      return *this;
+    }
+
+    std::string to_string() const {
+      using namespace util::literals;
+      if (mask == 0) return "None";
+
+      std::string out;
+      uintptr_t bits = mask;
+      while (bits) {
+        auto ps = util::bits::keepfirst(bits);
+        bits &= ~ps;
+        out += util::Byte_r(ps).to_string();
+        if (bits) out += ", ";
+      }
+      return out;
+    }
+
+    constexpr types::page_size_t min()
+    {
+      size_t res = util::bits::keepfirst(mask);
+      return static_cast<types::page_size_t>(res);
+    }
+
+    constexpr types::page_size_t max()
+    {
+      size_t res = util::bits::keeplast(mask);
+      return static_cast<types::page_size_t>(res);
+    }
+
+  };
+
+  /** Get bitfield with bit set for each supported page size */
+  page_sizes_t supported_page_sizes();
+
+  inline constexpr size_t min_psize() {
+    return supported_page_sizes().min().bytes();
+  }
+
+  inline constexpr size_t max_psize() {
+    return supported_page_sizes().max().bytes();
+  }
+
+  /** Determine if size is a supported page size */
+  bool supported_page_size(types::page_size_t size);
+} // os::mem
+
+namespace os::mem {
+  using namespace types;
+  /**
+   * Generic virtual-to-physical memory mapping description.
+   *
+   * Used as a building block for virtual memory APIs and backend-specific
+   * mappings.
+   *
+   * This is a lightweight value type that does not enforce invariants.
+   * In particular, page size restrictions, alignment, and attribute validity
+   * are not checked at construction time: they are merely described
+   *
+   * Attributes are additional information passed to the mapping: different
+   * mappings/subsystems will want to store different information here
+   */
+  template <typename Attributes>
+  struct Mapping
+  {
+    virt_addr_t lin  = 0;
+    phys_addr_t phys = 0;
+    Attributes attrs {};
+    mem_size_t size = 0;
+
+    // Bitmask of allowed page sizes for this mapping
+    //   - `any_size` means no restriction
+    //   - `0` is invalid
+    page_sizes_t page_sizes;
+
+
+    // empty or invalid mapping sentinel
+    constexpr Mapping() = default;
+
+    /** Construct with no page size restrictions */
+    constexpr Mapping(virt_addr_t linear, phys_addr_t physical, Attributes attributes, mem_size_t sz) noexcept
+      : lin{linear}, phys{physical}, attrs{attributes}, size{sz}, page_sizes{supported_page_sizes()} {}
+
+    /** Construct with explicit allowed page size mask */
+    constexpr Mapping(virt_addr_t linear, phys_addr_t physical, Attributes attributes, mem_size_t sz, page_sizes_t psz) noexcept
+      : lin{linear}, phys{physical}, attrs{attributes}, size{sz}, page_sizes{psz} {}
+
+
+    /** Truthy if non-empty and has page-size constraints */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return size != 0 && !page_sizes.empty();
+    }
+
+    /** Empty / invalid sentinel */
+    [[nodiscard]] constexpr bool empty() const noexcept {
+      return size == 0 || page_sizes.empty();
+    }
+
+    [[nodiscard]] constexpr bool operator==(const Mapping&) const noexcept = default;
+    [[nodiscard]] constexpr bool operator!=(const Mapping&) const noexcept = default;
+
+    /** end of linear range (exclusive) */
+    [[nodiscard]] constexpr virt_addr_t lin_end() const noexcept {
+      return lin + size;
+    }
+
+    /** end of physical range (exclusive) */
+    [[nodiscard]] constexpr phys_addr_t phys_end() const noexcept {
+      return phys + size;
+    }
+
+    /** smallest allowed page size */
+    [[nodiscard]] constexpr types::page_size_t min_psize() const noexcept {
+      return page_sizes.min();
+    }
+
+    /** largest allowed page size */
+    [[nodiscard]] constexpr types::page_size_t max_psize() const noexcept {
+      return page_sizes.max();
+    }
+
+    /** linear adjacency check */
+    [[nodiscard]] constexpr bool contiguous_with(const Mapping& rhs) const noexcept {
+      return (this->lin_end() == rhs.lin) || (rhs.lin_end() == this->lin);
+    }
+
+    /** physical adjacency check */
+    [[nodiscard]] constexpr bool physically_contiguous_with(const Mapping& rhs) const noexcept {
+      return (this->phys_end() == rhs.phys) || (rhs.phys_end() == this->phys);
+    }
+
+    /** attribute equality */
+    [[nodiscard]] constexpr bool same_attrs_as(const Mapping& rhs) const noexcept {
+      return attrs == rhs.attrs;
+    }
+
+    [[nodiscard]] static constexpr Mapping merge_maps(const Mapping& lhs, const Mapping& rhs) noexcept {
+      if (!rhs) return lhs;
+      if (!lhs) return rhs;
+
+      if (!lhs.contiguous_with(rhs)) {
+        std::printf("WARNING: os:mem::merge_maps: failed to merge non-contiguous linear mappings!\n");
+        return {};
+      }
+      if (!lhs.physically_contiguous_with(rhs)) {
+        // without this, we can't rely on the size to know the physical ending
+        // std::printf("WARNING: os:mem::merge_maps: merging non-contiguous physical mappings!\n");
+        // return {};
+      }
+      if (!lhs.same_attrs_as(rhs)) {
+        std::printf("WARNING: os:mem::merge_maps: failed to merge mappings with different attributes!\n");
+        return {};
+      }
+
+      Mapping m = {
+        std::min(lhs.lin, rhs.lin),
+        std::min(lhs.phys, rhs.phys),
+        lhs.attrs,
+        lhs.size + rhs.size,
+        lhs.page_sizes | rhs.page_sizes
+      };
+
+      // std::println("merged <{}> and <{}> to <{}>", lhs.to_string(), rhs.to_string(), m.to_string());
+
+      return m;
+    }
+
+    [[nodiscard]] constexpr Mapping merge_with(const Mapping& rhs) const noexcept {
+      return merge_maps(*this, rhs);
+    }
+
+    std::string to_string() const;
+  };
+} // os::mem
+
 
 namespace os::mem {
   using Raw_allocator = os::mem::mem_resource;
@@ -41,62 +259,7 @@ namespace os::mem {
   template <typename T>
   Typed_allocator<T> system_allocator() { return Typed_allocator<T>(raw_allocator()); }
 
-  /** Get bitfield with bit set for each supported page size */
-  uintptr_t supported_page_sizes();
-
-  /** Get the smallest supported page size */
-  size_t min_psize();
-
-  /** Get the largest supported page size */
-  size_t max_psize();
-
-  /** Determine if size is a supported page size */
-  bool supported_page_size(uintptr_t size);
-
-  /** String representation of supported page sizes */
-  std::string page_sizes_str(size_t bits);
-
-  /**
-   * Virtual to physical memory mapping.
-   * For interfacing with the virtual memory API, e.g. mem::map / mem::protect.
-   **/
-  template <typename Fl = Access>
-  struct Mapping
-  {
-    static const size_t any_size;
-
-    uintptr_t lin  = 0;
-    uintptr_t phys = 0;
-    Fl flags {};
-    size_t size = 0;
-    size_t page_sizes = 0;
-
-    // Constructors
-    Mapping() = default;
-
-    /** Construct with no page size restrictions */
-    inline Mapping(uintptr_t linear, uintptr_t physical, Fl fl, size_t sz);
-
-    /** Construct with page size restrictions */
-    inline Mapping(uintptr_t linear, uintptr_t physical, Fl fl, size_t sz, size_t psz);
-
-    inline operator bool() const noexcept;
-    inline bool operator==(const Mapping& rhs) const noexcept;
-    inline bool operator!=(const Mapping& rhs) const noexcept;
-    Mapping operator+(const Mapping& rhs) noexcept;
-    inline Mapping operator+=(const Mapping& rhs) noexcept;
-
-    // Smallest page size in map
-    inline size_t min_psize() const noexcept;
-
-    // Largest page size in map
-    inline size_t max_psize() const noexcept;
-
-    std::string to_string() const;
-
-  }; // struct Mapping<>
-
-  using Map = Mapping<>;
+  using Map = Mapping<Permission>;
 
   /** Exception class possibly used by various ::mem functions. **/
   class Memory_exception : public std::runtime_error
@@ -115,14 +278,15 @@ namespace os::mem {
    * effectively freeing the underlying physical memory.
    * The behavior is undefined if addr was not mapped with a call to map
    **/
-  Map unmap(uintptr_t addr);
+  Map unmap(virt_addr_t addr);
 
-  /** Get protection flags for page enclosing a given address */
-  Access flags(uintptr_t addr);
+  /** Get permission flags for page enclosing a given address */
+  Permission permissions(virt_addr_t addr);
 
   /** Determine active page size of a given linear address **/
-  uintptr_t active_page_size(uintptr_t addr);
-  uintptr_t active_page_size(void* addr);
+  page_size_t active_page_size(virt_addr_t addr);
+  inline page_size_t active_page_size(void* addr) { return active_page_size(virt_addr_t{reinterpret_cast<uintptr_t>(addr)}); }
+
 
   /**
    * Set and return access flags for a given linear address range.
@@ -134,26 +298,27 @@ namespace os::mem {
    * might result in 513 4KiB pages or 1 2MiB page and 1 4KiB page getting
    * protected.
    **/
-  Map protect(uintptr_t linear, size_t len, Access flags = Access::read);
+  Map protect(virt_addr_t linear, mem_size_t len, Permission perms = Permission::ReadOnly);
 
   /**
    * Set and return access flags for a given linear address range
    * The range is expected to be mapped by a previous call to map.
    **/
-  Access protect_range(uintptr_t linear, Access flags = Access::read);
+  Permission protect_range(virt_addr_t linear, Permission perms = Permission::ReadOnly);
 
   /**
-   * Set and return access flags for a page starting at linear.
+   * Set and return permission flags for a page starting at linear.
    * @note : the page size can be any of the supported sizes and
    *         protection will apply for that whole page.
    **/
-  Access protect_page(uintptr_t linear, Access flags = Access::read);
+  Permission protect_page(virt_addr_t linear, Permission perms = Permission::ReadOnly);
 
+  Map protect_existing(virt_addr_t linear, mem_size_t len, Permission perms = Permission::ReadOnly);
 
   /** Get the physical address to which linear address is mapped **/
-  uintptr_t virt_to_phys(uintptr_t linear);
+  phys_addr_t virt_to_phys(virt_addr_t linear);
 
-  void virtual_move(uintptr_t src, size_t size, uintptr_t dst, const char* label);
+  void virtual_move(virt_addr_t src, mem_size_t size, virt_addr_t dst, const char* label);
 
   /** Virtual memory map **/
   inline Memory_map& vmmap() {
@@ -168,153 +333,34 @@ namespace os::mem {
 
 
 namespace os::mem {
-
-  //
-  // mem::Mapping implementation
-  //
-
-  template <typename Fl>
-  Mapping<Fl>::Mapping(uintptr_t linear, uintptr_t physical, Fl fl, size_t sz)
-      : lin{linear}, phys{physical}, flags{fl}, size{sz},
-        page_sizes{any_size} {}
-
-  template <typename Fl>
-  Mapping<Fl>::Mapping(uintptr_t linear, uintptr_t physical, Fl fl, size_t sz, size_t psz)
-    : lin{linear}, phys{physical}, flags{fl}, size{sz}, page_sizes{psz}
-    {}
-
-  template <typename Fl>
-  bool Mapping<Fl>::operator==(const Mapping& rhs) const noexcept
-  { return lin == rhs.lin
-      && phys == rhs.phys
-      && flags == rhs.flags
-      && size == rhs.size
-      && page_sizes == rhs.page_sizes; }
-
-  template <typename Fl>
-  Mapping<Fl>::operator bool() const noexcept
-  { return size != 0 && page_sizes !=0; }
-
-  template <typename Fl>
-  bool Mapping<Fl>::operator!=(const Mapping& rhs) const noexcept
-  { return ! (*this == rhs); }
-
-  template <typename Fl>
-  Mapping<Fl> Mapping<Fl>::operator+(const Mapping& rhs) noexcept
+  template <typename Attributes>
+  inline std::string Mapping<Attributes>::to_string() const
   {
-    using namespace util::bitops;
-    Mapping res;
+    fmt::basic_memory_buffer<char, 1024> buf;
+    std::format_to(std::back_inserter(buf), "{:#x} -> {:#x}, size {}, attrs {:#x}", lin, phys, size, static_cast<unsigned long long>(attrs));
 
-    // Adding with empty map behaves like 0 + x / x + 0.
-    if (! rhs) {
-      return *this;
+    const bool is_single_psize = util::bits::popcount(page_sizes.mask) == 1;
+
+    if (is_single_psize) {
+      std::format_to(std::back_inserter(buf), " ({} pages of {})", size / page_sizes.min(), page_sizes.min().bytes());
+    } else {
+      fmt::format_to(std::back_inserter(buf), " (page sizes: {})", page_sizes.to_string());
     }
 
-    if (! *this)
-      return rhs;
-
-    if (res == rhs)
-      return res;
-
-    // The mappings must have connecting ranges
-    if ((rhs.lin + rhs.size != lin)
-        and lin + size != rhs.lin)
-    {
-      Ensures(!res);
-      return res;
-    }
-
-    // You can add to the front or the back
-    res.lin  = std::min(lin, rhs.lin);
-    res.phys = std::min(phys, rhs.phys);
-
-    // The mappings can span several page sizes
-    res.page_sizes |= rhs.page_sizes;
-    if (page_sizes && page_sizes != rhs.page_sizes)
-    {
-      res.page_sizes |= page_sizes;
-    }
-
-    res.size = size + rhs.size;
-    res.flags = flags & rhs.flags;
-
-    if (rhs)
-      Ensures(res);
-
-    return res;
-  }
-
-  template <typename Fl>
-  Mapping<Fl> Mapping<Fl>::operator+=(const Mapping& rhs) noexcept {
-    *this = *this + rhs;
-    return *this;
-  }
-
-  template <typename Fl>
-  size_t Mapping<Fl>::min_psize() const noexcept
-  { return util::bits::keepfirst(page_sizes); }
-
-  template <typename Fl>
-  size_t Mapping<Fl>::max_psize() const noexcept
-  { return util::bits::keeplast(page_sizes); }
-
-  template <typename Fl>
-  inline std::string Mapping<Fl>::to_string() const
-  {
-    using namespace util::literals;
-    char buffer[1024];
-    int len = snprintf(buffer, sizeof(buffer),
-            "%p -> %p, size %s, flags %#x",
-            (void*) lin,
-            (void*) phys,
-            util::Byte_r(size).to_string().c_str(),
-            (int) flags);
-
-    const bool isseq = __builtin_popcount(page_sizes) == 1;
-    if (isseq) {
-      len += snprintf(buffer + len, sizeof(buffer) - len,
-                      " (%lu pages á %s)",
-                      size / page_sizes,
-                      util::Byte_r(page_sizes).to_string().c_str());
-    }
-    else {
-      len += snprintf(buffer + len, sizeof(buffer) - len,
-              " (page sizes: %s)", page_sizes_str(page_sizes).c_str());
-    }
-
-    return std::string(buffer, len);
-  }
-
-  inline std::string page_sizes_str(size_t bits)
-  {
-    using namespace util::literals;
-    if (bits == 0) return "None";
-
-    std::string out;
-    while (bits){
-      auto ps = 1 << (__builtin_ffsl(bits) - 1);
-      bits &= ~ps;
-      out += util::Byte_r(ps).to_string();
-      if (bits)
-        out += ", ";
-    }
-
-    return out;
-  }
-
-  inline uintptr_t active_page_size(void* addr) {
-    return active_page_size((uintptr_t) addr);
+    return std::string(buf.data(), buf.size());
   }
 
   inline void
   virtual_move(uintptr_t src, size_t size, uintptr_t dst, const char* label)
   {
-    using namespace util::bitops;
-    const auto flags = os::mem::Access::read | os::mem::Access::write;
+    // note that this assumes that the source mapping has uniform permissions
+    const Permission perms = os::mem::permissions(src);
+
     // setup @dst as new virt area for @src
-    os::mem::map({dst, src, flags, size}, label);
-    // unpresent @src
-    os::mem::protect(src, size, os::mem::Access::none);
+    os::mem::map({dst, src, perms, size}, label);
+
+    // invalidate @src
+    os::mem::protect(src, size, os::mem::Permission::Forbidden);
   }
 }
 
