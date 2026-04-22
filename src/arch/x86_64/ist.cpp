@@ -31,43 +31,43 @@ struct stack {
 
 static stack create_stack_virt(size_t size, const char* name)
 {
-  using namespace os;
   using namespace util::bitops;
+  using namespace os::mem::types;
 
   // Virtual memory area for CPU stacks.
   // TODO randomize location / ask virtual memory allocator
-  const uintptr_t stack_area = 1ull << 46;
+  const virt_addr_t stack_area = 1ull << 46;
 
-  const mem::Access flags = mem::Access::read | mem::Access::write;
+  const os::mem::Permission perms = os::mem::Permission::Data;
 
   // Virtual area
   // Adds a guard page between each new stack
-  static uintptr_t stacks_begin = stack_area + GUARD_SIZE;
+  static virt_addr_t stacks_begin = stack_area + GUARD_SIZE;
 
   // Allocate physical memory
-  auto* phys = (char*)kalloc_aligned(4096, size);
-  IST_PRINT("* Creating stack '%s' @ %p (%p phys) \n",
-         name, (void*)stacks_begin, phys);
+  char* phys = static_cast<char*>(kalloc_aligned(4096, size));
+  phys_addr_t stacks_phys = reinterpret_cast<uintptr_t>(phys);
+  IST_PRINT("* Creating stack '%s' @ %p (%p phys) \n", name, reinterpret_cast<void*>(stacks_begin), phys);
 
-  const auto map = mem::map({stacks_begin, (uintptr_t)phys, flags, size}, name);
+  const os::mem::Map map = os::mem::map({stacks_begin, stacks_phys, perms, size}, name);
 
   Expects(map);
-  Expects(mem::active_page_size(map.lin) == 4096);
-  Expects(mem::flags(map.lin - 1) == mem::Access::none
-          && "Guard page should not present");
+  Expects(os::mem::active_page_size(map.lin) == 4096_psz);
+  Expects(os::mem::permissions(map.lin - mem_size_t{1}) == os::mem::Permission::Forbidden && "Guard page should not present");
 
   // Next stack starts after next page
   stacks_begin += util::bits::roundto<4096>(size) + GUARD_SIZE;
 
   // Align stack pointer to bottom of stack minus a pop
-  auto sp = map.lin + size - 8;
-  sp &= ~uintptr_t(0xf);
+  virt_addr_t sp = map.lin + map.size - mem_size_t{8};
+  sp = virt_addr_t{sp.value & ~uintptr_t(0xf)};
 
   // Force page fault if mapped area isn't writable
-  ((char*)sp)[0] = '!';
+  reinterpret_cast<char*>(sp.value)[0] = '!';
 
-  return {(void*) sp, phys};
+  return {reinterpret_cast<void*>(sp.value), phys};
 }
+
 static stack create_stack_simple(size_t size, const char* /*name*/)
 {
   auto* phys = (char*)kalloc_aligned(4096, size);
