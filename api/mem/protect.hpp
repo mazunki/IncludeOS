@@ -3,7 +3,7 @@
 #include <mem/flags.hpp>
 #include <util/pretty.hpp>
 
-#define TRACE_MEM_PROTECT
+// #define TRACE_MEM_PROTECT
 #if defined(TRACE_MEM_PROTECT)
   #define MEM_PROTECT_TRACE(fmt, ...) std::println("\033[0;94m{}\033[0m: \033[0;90m" fmt "\033[0m", __FUNCTION__, ##__VA_ARGS__)
 #else
