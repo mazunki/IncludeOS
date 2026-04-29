@@ -12,26 +12,22 @@
 
 static inline os::mem::Permission to_permission(int prot)
 {
-  switch (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) {
-    case PROT_NONE:
-      return os::mem::Permission::Forbidden;
-    case PROT_READ:
-      return os::mem::Permission::ReadOnly;
-    case PROT_WRITE:
-      return os::mem::Permission::WriteOnly;
-    case PROT_EXEC:
-      return os::mem::Permission::ExecuteOnly;
-    case PROT_READ | PROT_WRITE:
-      return os::mem::Permission::Data;
-    case PROT_READ | PROT_EXEC:
-      return os::mem::Permission::Code;
-    case PROT_WRITE | PROT_EXEC:
-      return os::mem::Permission::CodeBuffer;
-    case PROT_READ | PROT_WRITE | PROT_EXEC:
-      return os::mem::Permission::Open;
-    default:
-      throw std::invalid_argument("illegal protection flag");
+  static constexpr os::mem::Permission table[8] = {
+    os::mem::Permission::Forbidden,   // 0: PROT_NONE
+    os::mem::Permission::ReadOnly,    // 1: PROT_READ
+    os::mem::Permission::WriteOnly,   // 2: PROT_WRITE
+    os::mem::Permission::Data,        // 3: PROT_READ|PROT_WRITE
+    os::mem::Permission::ExecuteOnly, // 4: PROT_EXEC
+    os::mem::Permission::Code,        // 5: PROT_READ|PROT_EXEC
+    os::mem::Permission::CodeBuffer,  // 6: PROT_WRITE|PROT_EXEC
+    os::mem::Permission::Open,        // 7: PROT_READ|PROT_WRITE|PROT_EXEC
+  };
+
+  if (UNLIKELY(prot >= 8)) {
+    throw std::invalid_argument("illegal protection flag");
   }
+
+  return table[prot & 7];
 }
 
 static inline void __sys_mprotect(uintptr_t addr, size_t length, os::mem::Permission perms)
