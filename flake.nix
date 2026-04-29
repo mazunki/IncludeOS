@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/25.05";
     # vmrunner.url = "github:includeos/vmrunner";
-    vmrunner.url = "github:mazunki/vmrunner/dev";
+    vmrunner.url = "github:mazunki/vmrunner";
   };
 
   outputs = { self, nixpkgs, vmrunner }:
