@@ -49,10 +49,7 @@ inline static bool is_for_production_use() {
   return &__for_production_use == (char*) 0x2000;
 }
 
-kernel::State __kern_state;
-kernel::State& kernel::state() noexcept {
-  return __kern_state;
-}
+namespace kernel { State __kern_state; }
 
 util::KHz os::cpu_freq() {
   return kernel::cpu_freq();

@@ -50,7 +50,8 @@ namespace kernel {
     //const uintptr_t elf_binary_size = 0;
   };
 
-  State& state() noexcept;
+  extern State __kern_state;
+  inline State& state() noexcept { return __kern_state; }
 
   inline bool is_running() noexcept {
     return state().running;
