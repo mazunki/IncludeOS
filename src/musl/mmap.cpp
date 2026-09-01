@@ -208,7 +208,11 @@ static void* sys_mmap(void* _addr, size_t length, int _prot, int _flags, int _fd
   const Fd file_descriptor = (_fd == -1) ? std::nullopt : Fd(_fd);
   const uintptr_t addr = reinterpret_cast<uintptr_t>(_addr);
 
-  return __sys_mmap(addr, length, perms, flags, file_descriptor, offset);
+  try {
+    return __sys_mmap(addr, length, perms, flags, file_descriptor, offset);
+  } catch (const std::bad_alloc&) {
+    return mmap_failed(ENOMEM);
+  }
 }
 
 extern "C"
