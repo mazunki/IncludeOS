@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <bit>
+#include <cstring>
+#include <algorithm>
 #ifdef INCLUDEOS_SMP_ENABLE
 #include <smp>
 #include <mutex>
@@ -24,6 +26,11 @@ struct mem_stats {
   std::uint64_t count_alloc{};
   std::uint64_t count_alloc_at{};
   std::uint64_t count_dealloc{};
+  std::uint64_t count_realloc{};
+  std::uint64_t count_expand{}; // only counts successful in-place expansions
+  std::uint64_t count_shrink{};
+  std::uint64_t count_allocate_all{};
+  std::uint64_t count_allocate_largest{};
 };
 
 struct mem_region {
@@ -34,6 +41,10 @@ struct mem_region {
 
   std::byte* start_ptr() const noexcept { return reinterpret_cast<std::byte*>(start); }
   std::byte* end_ptr()   const noexcept { return reinterpret_cast<std::byte*>(end); }
+
+  bool owns(std::uintptr_t addr) const noexcept {
+    return addr >= start && addr < end;
+  }
 };
 
 struct mem_config {
@@ -82,6 +93,121 @@ public:
     return do_allocate_at(where, bytes, alignment, permit_override);
   }
 
+  /*
+   * see API by Andrei Alexandrescu in 'allocator Is to Allocation what vector Is to Vexation'
+   */
+  bool owns(const void* p) const noexcept {
+    return config_.region.owns(reinterpret_cast<std::uintptr_t>(p));
+  }
+
+  /**
+   * how much would be reserved as a lower bound for a request of this size
+   */
+  std::size_t good_size(std::size_t bytes, std::size_t alignment=alignof(std::max_align_t)) const noexcept {
+    return strat_good_size(bytes, alignment);
+  }
+
+  // this strategy's own natural/minimum alignment
+  std::size_t alignment() const noexcept {
+    return strat_alignment();
+  }
+
+  /*
+   * safer versions of the std::pmr::memory_resource interface
+   *
+   *   mem_region allocate_region(size_t bytes, size_t alignment);
+   *   void deallocate_region(const mem_region& blk, size_t alignment);
+   *   void reallocate(const mem_region& blk, std::size_t new_bytes, size_t alignment);
+   *
+   * by using the raw void pointers, we would trust the consumers won't make mistakes:
+   *   void* p = res.allocate(bytes, alignment);
+   *   mem_region blk{ (uintptr_t)p, (uintptr_t)p + bytes }; // wrong if alignment > bytes
+   **/
+  mem_region allocate_region(std::size_t bytes, std::size_t alignment=alignof(std::max_align_t)) {
+    void* p = this->allocate(bytes, alignment);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    return mem_region{ addr, addr + good_size(bytes, alignment) };
+  }
+
+  void deallocate_region(const mem_region& blk, std::size_t alignment=alignof(std::max_align_t)) {
+    this->deallocate(blk.start_ptr(), blk.size(), alignment);
+  }
+
+  /**
+   * try to allocate the entiry of the remaining space in a single allocation.
+   * allocator has no guarantee that this is possible
+   */
+  mem_region allocate_all() noexcept {
+    // note: doesn't update protection flags
+    mem_region result = strat_allocate_all();
+    if (result.size() == 0)
+      return result;
+
+    stats_.requested_bytes += result.size();
+    if (stats_.requested_bytes > stats_.peak_requested_bytes) {
+      stats_.peak_requested_bytes = stats_.requested_bytes;
+    }
+    stats_.count_allocate_all++;
+    return result;
+  }
+
+  // the single largest block currently satisfiable, not necessarily all
+  // remaining capacity.
+  mem_region allocate_largest() noexcept {
+    // note: doesn't update protection flags
+    mem_region result = strat_allocate_largest();
+    if (result.size() == 0)
+      return result;
+
+    stats_.requested_bytes += result.size();
+    if (stats_.requested_bytes > stats_.peak_requested_bytes) {
+      stats_.peak_requested_bytes = stats_.requested_bytes;
+    }
+    stats_.count_allocate_largest++;
+    return result;
+  }
+
+  void deallocate_all() {
+    strat_deallocate_all();
+    stats_.requested_bytes = 0;
+  }
+
+  // might move the address
+  // note: doesn't update protection flags
+  void reallocate(mem_region& blk, std::size_t new_bytes, std::size_t alignment=alignof(std::max_align_t)) {
+    strat_reallocate(blk, new_bytes, alignment);
+    stats_.count_realloc++;
+  }
+
+  // grow in place only, never moves.
+  // returns false if there is no room right now, blk remains unchanged
+  // note: doesn't update protection flags
+  bool expand(mem_region& blk, std::size_t delta) noexcept {
+    if (!strat_expand(blk, delta))
+      return false;
+
+    stats_.requested_bytes += delta;
+    if (stats_.requested_bytes > stats_.peak_requested_bytes) {
+      stats_.peak_requested_bytes = stats_.requested_bytes;
+    }
+    stats_.count_expand++;
+    return true;
+  }
+
+  // shrink in place by delta bytes, same start address. false if delta is
+  // bigger than the block itself; otherwise should always succeed
+  // note: doesn't update protection flags
+  bool shrink(mem_region& blk, std::size_t delta) noexcept {
+    if (delta > blk.size())
+      return false;
+    if (!strat_shrink(blk, delta))
+      return false;
+
+    stats_.requested_bytes -= delta;
+    stats_.count_shrink++;
+    return true;
+  }
+
   virtual size_t bytes_used() const noexcept = 0;
   virtual size_t bytes_free() const noexcept = 0;
   virtual uintptr_t highest_used() const noexcept = 0;
@@ -92,6 +218,86 @@ protected:
    */
   virtual uintptr_t strat_allocate(std::size_t bytes, std::size_t alignment) = 0;
   virtual void  strat_deallocate(uintptr_t p, std::size_t bytes, std::size_t alignment) noexcept = 0;
+  virtual std::size_t strat_good_size(std::size_t bytes, std::size_t alignment) const noexcept = 0;
+  virtual std::size_t strat_alignment() const noexcept = 0;
+
+  /*
+   * default implementation is a reasonable default:
+   *   tries shrink()/expand() before falling back to allocate+copy+free
+   **/
+  virtual void strat_reallocate(mem_region& blk, std::size_t new_bytes, std::size_t alignment) {
+    if (new_bytes <= blk.size()) {
+      this->shrink(blk, blk.size() - new_bytes);
+      return;
+    }
+
+    if (this->expand(blk, new_bytes - blk.size())) {
+      return;
+    }
+
+    // fallback: needs temporary space, and causes a memcpy :(
+    void* new_ptr = this->allocate(new_bytes, alignment);
+    std::memcpy(new_ptr, blk.start_ptr(), std::min(blk.size(), new_bytes));
+    this->deallocate(blk.start_ptr(), blk.size(), alignment);
+    const uintptr_t new_addr = reinterpret_cast<uintptr_t>(new_ptr);
+    blk = mem_region{ new_addr, new_addr + new_bytes };
+  }
+
+  virtual bool strat_expand(mem_region& blk, std::size_t delta) noexcept = 0;
+
+  virtual mem_region strat_allocate_all() noexcept = 0;
+
+  virtual mem_region strat_allocate_largest() noexcept {
+    /*
+     * poorly optimized default implementation
+     *   binary search on size via allocate()/deallocate()
+     * allocators should ideally implement their own version of this
+     */
+    std::size_t lo = 0, hi = this->bytes_free();
+    void* best_ptr = nullptr;
+    std::size_t best_size = 0;
+
+    while (lo < hi) {
+      const std::size_t mid = lo + (hi - lo + 1) / 2;
+      void* p = nullptr;
+      try {
+        p = this->allocate(mid, alignof(std::max_align_t));
+      } catch (...) {
+        hi = mid - 1;
+        continue;
+      }
+
+      if (best_ptr) {
+        this->deallocate(best_ptr, best_size, alignof(std::max_align_t));
+      }
+
+      best_ptr = p;
+      best_size = mid;
+      lo = mid;
+    }
+
+    if (!best_ptr) return mem_region{};
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(best_ptr);
+    return mem_region{ addr, addr + best_size };
+  }
+
+  virtual bool strat_shrink(mem_region& blk, std::size_t delta) noexcept {
+    /*
+     * the default implementation is always valid, but allocators should probably
+     * implement their own strategies so the gap can be reclaimed
+     *
+     * delta is assumed to be valid here (i.e. delta is smaller than the block's size)
+     */
+    blk = mem_region{ blk.start, blk.end - delta };
+    return true;
+  }
+
+  virtual void strat_deallocate_all() {
+    /*
+     * optional feature, but probably desired
+     **/
+    throw std::runtime_error("mem_resource::deallocate_all: not supported by this allocator strategy");
+  }
 
   virtual uintptr_t strat_allocate_at(uintptr_t where, std::size_t bytes, std::size_t alignment, bool permit_override) {
     /*
