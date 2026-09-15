@@ -130,6 +130,134 @@ public:
 protected:
   std::string_view name() const noexcept override { return "buddy"; }
 
+  std::size_t strat_good_size(std::size_t bytes, std::size_t alignment) const noexcept override {
+    // the good size will be an exact size since we split any bigger
+    // chunk down until it's a tight fit
+
+    const std::size_t aligned_bytes = std::max(bytes, alignment);
+    const int want = order_for(aligned_bytes);
+    if (want > max_order_) {
+      return 0;
+    }
+    return std::size_t(1) << want;
+  }
+
+  std::size_t strat_alignment() const noexcept override {
+    return bcfg_.min_block;
+  }
+
+  /**
+   * resets the freelist to a single top-level block spanning the whole
+   * pool, discarding every outstanding allocation at once.
+   */
+  void strat_deallocate_all() noexcept override {
+    for (std::size_t i = 0; i < orders_; ++i) {
+      free_[i] = nullptr;
+    }
+    push_free(pool_base_, max_order_);
+    busy_bytes_ = 0;
+    highest_used_ = 0;
+  }
+
+  // works only if blk is the left child at every order between its
+  // current one and the target, and each successive buddy is free.
+  bool strat_expand(mem_region& blk, std::size_t delta) noexcept override {
+    const std::size_t old_bytes = blk.size();
+    const std::size_t new_bytes = old_bytes + delta;
+
+    const int have = order_for(old_bytes);
+    const int want = order_for(new_bytes);
+
+    if (want == have) {
+      // same buddy, caused by alignment rounding
+      blk = mem_region{ blk.start, blk.start + new_bytes };
+      return true;
+    }
+
+    for (int level = have; level < want; ++level) {
+      const std::uintptr_t bud = buddy_of(blk.start, level);
+      if (bud < blk.start || !is_free(bud, level)) {
+        return false;  // how rude of them
+      }
+    }
+
+    // we know there's nobody in our way, so we can just claim the space
+    // note: this assumption is not thread-safe
+    for (int level = have; level < want; ++level) {
+      remove_if_free(buddy_of(blk.start, level), level);
+    }
+
+    const std::size_t old_reserved = std::size_t(1) << have;
+    const std::size_t new_reserved = std::size_t(1) << want;
+    busy_bytes_ += (new_reserved - old_reserved);
+    peak_busy_bytes_ = std::max(peak_busy_bytes_, busy_bytes_);
+
+    const std::uintptr_t new_end = blk.start + new_reserved;
+    highest_used_ = std::max(highest_used_, new_end);
+    peak_highest_used_ = std::max(peak_highest_used_, new_end);
+
+    blk = mem_region{ blk.start, blk.start + new_bytes };
+    return true;
+  }
+
+  // only works if the whole pool is still a single free top-level block 🙃
+  mem_region strat_allocate_all() noexcept override {
+    if (free_[idx(max_order_)] == nullptr) {
+      return mem_region{}; // fragmented, no single top-level block
+    }
+
+    const std::uintptr_t addr = pop_free(max_order_);
+    const std::uintptr_t end = addr + pool_size_;
+
+    busy_bytes_ += pool_size_;
+    peak_busy_bytes_ = std::max(peak_busy_bytes_, busy_bytes_);
+    highest_used_ = std::max(highest_used_, end);
+    peak_highest_used_ = std::max(peak_highest_used_, end);
+
+    return mem_region{ addr, end };
+  }
+
+  mem_region strat_allocate_largest() noexcept override {
+    for (int order = max_order_; order >= min_order_; --order) {
+      if (free_[idx(order)] == nullptr) continue;
+
+      const std::uintptr_t addr = pop_free(order);
+      const std::size_t reserved = std::size_t(1) << order;
+      const std::uintptr_t end = addr + reserved;
+
+      busy_bytes_ += reserved;
+      peak_busy_bytes_ = std::max(peak_busy_bytes_, busy_bytes_);
+      highest_used_ = std::max(highest_used_, end);
+      peak_highest_used_ = std::max(peak_highest_used_, end);
+
+      return mem_region{ addr, end };
+    }
+    return mem_region{}; // nothing free at all
+  }
+
+  // note: assumes blk.size() is the actual reserved size
+  bool strat_shrink(mem_region& blk, std::size_t delta) noexcept override {
+    const std::size_t old_bytes = blk.size();
+    const std::size_t new_bytes = old_bytes - delta;
+
+    const int have = order_for(old_bytes);
+    const int want = order_for(std::max(new_bytes, bcfg_.min_block));
+
+    if (want >= have) {
+      // still the same size class, nothing to give back
+      blk = mem_region{ blk.start, blk.end - delta };
+      return true;
+    }
+
+    split_left(blk.start, have, want);
+
+    const std::size_t freed = (std::size_t(1) << have) - (std::size_t(1) << want);
+    busy_bytes_ -= freed;
+
+    blk = mem_region{ blk.start, blk.end - delta };
+    return true;
+  }
+
   std::uintptr_t strat_allocate(std::size_t bytes, std::size_t alignment) override {
     // mem_resource already validated alignment is power-of-two, this is a requirement
 
@@ -358,6 +486,17 @@ private:
         return true;
       }
       cur = &((*cur)->next);
+    }
+    return false;
+  }
+
+  // same search as remove_if_free, but read-only
+  bool is_free(std::uintptr_t addr, int order) const noexcept {
+    const auto* target = reinterpret_cast<const FreeNode*>(addr);
+    const FreeNode* cur = free_[idx(order)];
+    while (cur) {
+      if (cur == target) return true;
+      cur = cur->next;
     }
     return false;
   }
