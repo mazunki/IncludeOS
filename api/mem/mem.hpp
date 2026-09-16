@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <string_view>
 #include <bit>
+#ifdef INCLUDEOS_SMP_ENABLE
+#include <smp>
+#include <mutex>
+#endif
 
 namespace os::mem {
 struct mem_stats {
@@ -103,6 +107,9 @@ private:
    */
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) final {
+#ifdef INCLUDEOS_SMP_ENABLE
+    std::lock_guard<Spinlock> guard(alloc_lock_);
+#endif
     // pre: validate alignment
     if (!std::has_single_bit(alignment))
       throw std::invalid_argument("alignment must be a power of 2");
@@ -127,6 +134,9 @@ private:
   }
 
   void* do_allocate_at(void* where, std::size_t bytes, std::size_t alignment) {  // not final since it's not a virtual: can't be overriden anyway
+#ifdef INCLUDEOS_SMP_ENABLE
+    std::lock_guard<Spinlock> guard(alloc_lock_);
+#endif
     auto addr = reinterpret_cast<std::uintptr_t>(where);
 
     // pre: validate alignment
@@ -154,6 +164,9 @@ private:
   }
 
   void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) final {
+#ifdef INCLUDEOS_SMP_ENABLE
+    std::lock_guard<Spinlock> guard(alloc_lock_);
+#endif
     // pre: TODO: verify region was actually allocated?
 
     if (p != nullptr)
@@ -171,6 +184,9 @@ private:
 
   mem_stats stats_{};
   mem_config config_{};
+#ifdef INCLUDEOS_SMP_ENABLE
+  Spinlock alloc_lock_;
+#endif
 };
 
 } // namespace os::mem
