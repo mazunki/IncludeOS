@@ -1,18 +1,31 @@
-#include "kernel/memory.hpp"
-#include <os>
-#include <service>
+#include <sys/mman.h>
+#include <print>
+#include <cstdlib>
 
-void Service::start(const std::string& args){
-  std::println("Hello from the example unikernel!");
-  std::println();
+int main() {
+  constexpr size_t page_sz = 4096;
 
-  std::println("Current virtual mappings:");
-  for (const auto& entry : os::mem::vmmap())
-      std::println(" {}", entry.second.to_string());
-  std::println();
+  volatile int* p = (volatile int*) mmap(nullptr, page_sz*16, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-  std::println("Tip: Try changing how much memory you give to the service in vm.json");
-  std::println("Service done. Shutting down...");
+  if (p == MAP_FAILED) {
+    std::println("mmap failed");
+    return 1;
+  }
 
-  os::shutdown();
+  std::printf("before='%d'\n", p[0]);
+  p[0] = 42;
+  std::printf("after='%d'\n", p[0]);
+
+  if (mprotect((void*)p, 4000, PROT_READ) != 0) {
+    std::println("mprotect failed");
+    return 1;
+  }
+
+  std::printf("protected='%d'\n", p[0]);
+
+  std::println("about to write to read-only page; this should fault");
+  p[page_sz+2] = 69;
+
+  std::printf("BUG: write succeeded, value='%d'\n", p[0]);
+  return 0;
 }

@@ -83,7 +83,7 @@ namespace net {
 
   void BufferStore::create_new_pool()
   {
-    auto* pool = (uint8_t*) aligned_alloc(os::mem::min_psize(), poolsize_);
+    auto* pool = (uint8_t*) aligned_alloc(os::mem::supported_page_sizes().min().bytes(), poolsize_);
     if (UNLIKELY(pool == nullptr)) {
       throw std::runtime_error("Buffer store failed to allocate memory");
     }

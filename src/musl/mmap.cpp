@@ -5,12 +5,21 @@
 #include <mem/mem.hpp>
 #include <mem/flags.hpp>
 #include <mem/alloc/buddy.hpp>
+#include <mem/protect.hpp>
 #include <os>
 #include <kernel/memory.hpp>
 #include <kernel.hpp>
 #include <kprint>
 #include <new>
 #include <cstring>
+#include <util/pretty.hpp>
+
+// #define TRACE_MMAP
+#if defined(TRACE_MMAP)
+  #define MMAP_TRACE(fmt, ...) std::println("\033[0;94m{}\033[0m: \033[0;90m" fmt "\033[0m", __FUNCTION__, ##__VA_ARGS__)
+#else
+  #define MMAP_TRACE(...) do {} while(0)
+#endif
 
 static os::mem::buddy_resource* buddy_alloc = nullptr;
 static os::mem::mem_resource* default_allocator = nullptr;
@@ -91,9 +100,17 @@ static void* mmap_failed(int err) {
 
 using Fd = std::optional<int>;
 
-static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os::mem::alloc::Flags flags, Fd file_descriptor, off_t offset)
+static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Permission perms, os::mem::alloc::Flags flags, Fd file_descriptor, off_t offset)
 {
   using os::mem::alloc::Flags;
+
+  MMAP_TRACE("({}, {}, {}, {}, {}, {})",
+             KVF(addr,   "{:#x}"),
+             KVA(length, util::format::Bytes{length}),
+             KV(perms),
+             KV(flags),
+             KVE("fd",   file_descriptor.value_or(-1)),
+             KV(offset));
 
   if (util::has_flag(flags, Flags::Private) ==
       util::has_flag(flags, Flags::Shared))
@@ -142,7 +159,7 @@ static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os:
       util::has_flag(flags, Flags::FixedOverride))
   {
     const size_t page_sz = PAGE_SIZE;
-    const size_t len_rounded = util::bits::roundto(page_sz, length);
+    const size_t len_rounded = util::bits::align_up(page_sz, length);
 
     if (addr == 0) {
       return mmap_failed(EINVAL);
@@ -155,6 +172,8 @@ static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os:
     const bool do_override = util::has_flag(flags, Flags::FixedOverride);
 
     res = kalloc_fixed(reinterpret_cast<void*>(addr), len_rounded, do_override);
+    MMAP_TRACE("kalloc_fixed => {:#x} (requested {:#x})", reinterpret_cast<uintptr_t>(res), addr);
+    __sys_mprotect(addr, len_rounded, perms);
   }
   else {
     if (util::has_flag(flags, Flags::Private)) {
@@ -169,6 +188,8 @@ static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os:
       }
 
       res = kalloc(length);
+      MMAP_TRACE("kalloc => {:#x} (requested {:#x})", reinterpret_cast<uintptr_t>(res), addr);
+      __sys_mprotect(reinterpret_cast<uintptr_t>(res), length, perms);
     }
   }
 
@@ -183,11 +204,11 @@ static void* __sys_mmap(uintptr_t addr, size_t length, os::mem::Access prot, os:
 static void* sys_mmap(void* _addr, size_t length, int _prot, int _flags, int _fd, off_t offset)
 {
   const auto flags = static_cast<os::mem::alloc::Flags>(_flags);
-  const auto prot  = static_cast<os::mem::Access>(_prot);
+  const auto perms = to_permission(_prot);
   const Fd file_descriptor = (_fd == -1) ? std::nullopt : Fd(_fd);
   const uintptr_t addr = reinterpret_cast<uintptr_t>(_addr);
 
-  return __sys_mmap(addr, length, prot, flags, file_descriptor, offset);
+  return __sys_mmap(addr, length, perms, flags, file_descriptor, offset);
 }
 
 extern "C"
