@@ -49,21 +49,17 @@ struct Pool {
   std::unique_ptr<os::mem::buddy_resource> alloc;
 };
 
-// NOTE: bytes_used()/bytes_free()/highest_used() are stubbed to always
-// return 0 at this point in history (fixed by "trace allocated bytes") --
-// this version only exercises the malloc/free happy path and pool
-// ownership. Byte-accounting assertions are added back in a follow-up
-// commit once that tracking actually exists.
-
 CASE("mem::buddy init allocator"){
   using namespace util;
   Pool pool(64_KiB);
   auto& alloc = *pool.alloc;
 
+  EXPECT(alloc.bytes_used() == 0);
   auto addr = alloc.malloc(4_KiB);
   EXPECT(addr);
-  EXPECT(pool.owns(addr));
+  EXPECT(alloc.bytes_used() == 4_KiB);
   alloc.free(addr, 4_KiB);
+  EXPECT(alloc.bytes_used() == 0);
 }
 
 CASE("mem::buddy basic allocation / deallocation"){
@@ -72,27 +68,28 @@ CASE("mem::buddy basic allocation / deallocation"){
   Pool pool(64_KiB, 4_KiB);
   auto& alloc = *pool.alloc;
 
+  size_t sum = 0;
   std::vector<std::pair<uintptr_t, size_t>> allocations;
 
-  // Allocate every power-of-two size that fits, until the pool is exhausted
-  for (size_t sz = 4_KiB; sz <= pool.size; sz *= 2) {
-    uintptr_t addr;
-    try {
-      addr = alloc.malloc(sz);
-    } catch (const std::bad_alloc&) {
-      break;
-    }
+  // Allocate every power-of-two size that fits
+  for (size_t sz = 4_KiB; sz < alloc.bytes_free(); sz *= 2) {
+    auto addr = alloc.malloc(sz);
     EXPECT(addr);
     EXPECT(pool.owns(addr));
+    EXPECT(alloc.highest_used() == addr + sz);
     allocations.emplace_back(addr, sz);
+    sum += sz;
+    EXPECT(alloc.bytes_used() == sum);
   }
-
-  EXPECT(not allocations.empty());
 
   // Deallocate in the same order
   for (auto [addr, sz] : allocations) {
+    sum -= sz;
     alloc.free(addr, sz);
+    EXPECT(alloc.bytes_used() == sum);
   }
+
+  EXPECT(alloc.bytes_used() == 0);
 }
 
 CASE("mem::buddy random ordered allocation then deallocation"){
@@ -101,11 +98,18 @@ CASE("mem::buddy random ordered allocation then deallocation"){
   Pool pool(32_MiB);
   auto& alloc = *pool.alloc;
 
+  size_t sum = 0;
   std::vector<std::pair<uintptr_t, size_t>> allocations;
 
   for (auto rnd : test::random_1k) {
+    if (alloc.bytes_free() == 0)
+      break;
+
     const size_t want = std::max<size_t>(64, rnd % (32_KiB));
     const size_t sz = std::bit_ceil(want);
+
+    if (sz > alloc.bytes_free())
+      continue;
 
     uintptr_t addr;
     try {
@@ -116,14 +120,23 @@ CASE("mem::buddy random ordered allocation then deallocation"){
     EXPECT(addr);
     EXPECT(pool.owns(addr));
     allocations.emplace_back(addr, sz);
+    sum += sz;
+    EXPECT(alloc.bytes_used() == sum);
   }
 
-  EXPECT(not allocations.empty());
+  auto highest = std::max_element(allocations.begin(), allocations.end(),
+    [](auto& a, auto& b) { return a.first < b.first; });
+  EXPECT(highest != allocations.end());
+  EXPECT(alloc.highest_used() == highest->first + highest->second);
 
   // Deallocate
   for (auto [addr, sz] : allocations) {
+    sum -= sz;
     alloc.free(addr, sz);
+    EXPECT(alloc.bytes_used() == sum);
   }
+
+  EXPECT(alloc.bytes_used() == 0);
 }
 
 struct Allocation {
@@ -155,37 +168,43 @@ CASE("mem::buddy random chaos with data verification"){
   Pool pool(1_GiB);
   auto& alloc = *pool.alloc;
 
+  EXPECT(alloc.bytes_used() == 0);
+
   std::vector<Allocation> allocs;
 
   for (auto rnd : test::random_1k) {
     const size_t sz = std::max<size_t>(64, std::bit_ceil<size_t>(rnd % 64_KiB));
 
-    Allocation a;
-    a.size = sz;
-    uintptr_t addr;
-    try {
-      addr = alloc.malloc(sz);
-    } catch (const std::bad_alloc&) {
-      addr = 0;
-    }
-    if (addr != 0) {
-      a.addr = addr;
-      a.data = 'A' + (rnd % ('Z' - 'A'));
-      EXPECT(pool.owns(a.addr));
+    if (sz <= alloc.bytes_free()) {
+      Allocation a;
+      a.size = sz;
+      uintptr_t addr;
+      try {
+        addr = alloc.malloc(sz);
+      } catch (const std::bad_alloc&) {
+        addr = 0;
+      }
+      if (addr != 0) {
+        a.addr = addr;
+        a.data = 'A' + (rnd % ('Z' - 'A'));
+        EXPECT(pool.owns(a.addr));
 
-      auto overlap = std::find_if(allocs.begin(), allocs.end(),
-        [&a](const Allocation& other) { return other.overlaps(a); });
-      EXPECT(overlap == allocs.end());
+        auto overlap = std::find_if(allocs.begin(), allocs.end(),
+          [&a](const Allocation& other) { return other.overlaps(a); });
+        EXPECT(overlap == allocs.end());
 
-      memset(reinterpret_cast<void*>(a.addr), a.data, a.size);
-      allocs.emplace_back(a);
+        memset(reinterpret_cast<void*>(a.addr), a.data, a.size);
+        allocs.emplace_back(a);
+      }
     }
 
     // Deallocate a random allocation most of the time
-    if (rnd % 3 != 0 and not allocs.empty()) {
+    if ((rnd % 3 != 0 or alloc.bytes_free() == 0) and not allocs.empty()) {
       auto it = allocs.begin() + (rnd % allocs.size());
       EXPECT(it->verify_data());
+      auto use_pre = alloc.bytes_used();
       alloc.free(it->addr, it->size);
+      EXPECT(alloc.bytes_used() == use_pre - it->size);
       allocs.erase(it);
     }
   }
@@ -193,6 +212,8 @@ CASE("mem::buddy random chaos with data verification"){
   for (auto& a : allocs) {
     alloc.free(a.addr, a.size);
   }
+
+  EXPECT(alloc.bytes_used() == 0);
 }
 
 CASE("mem::buddy as pmr::memory_resource") {
@@ -204,7 +225,9 @@ CASE("mem::buddy as pmr::memory_resource") {
   std::pmr::polymorphic_allocator<int> alloc(resource);
   std::pmr::vector<int> numbers(alloc);
 
+  EXPECT(resource->bytes_used() == 0);
   numbers.push_back(10);
+  EXPECT(resource->bytes_used() > 0);
   numbers.push_back(20);
   numbers.push_back(30);
   numbers.push_back(40);
@@ -212,6 +235,7 @@ CASE("mem::buddy as pmr::memory_resource") {
   // Force the vector to return memory
   numbers.clear();
   numbers.shrink_to_fit();
+  EXPECT(resource->bytes_used() == 0);
 
   // Make sure it still works as expected
   numbers.push_back(20);
@@ -222,6 +246,7 @@ CASE("mem::buddy as pmr::memory_resource") {
 
   numbers.clear();
   numbers.shrink_to_fit();
+  EXPECT(resource->bytes_used() == 0);
 }
 
 CASE("mem::buddy as std::allocator") {
@@ -232,7 +257,9 @@ CASE("mem::buddy as std::allocator") {
 
   std::vector<int, os::mem::Allocator<int, os::mem::buddy_resource>> numbers(*resource);
 
+  EXPECT(resource->bytes_used() == 0);
   numbers.push_back(10);
+  EXPECT(resource->bytes_used() > 0);
   numbers.push_back(20);
   numbers.push_back(30);
   numbers.push_back(40);
@@ -240,6 +267,7 @@ CASE("mem::buddy as std::allocator") {
   // Force the vector to return memory
   numbers.clear();
   numbers.shrink_to_fit();
+  EXPECT(resource->bytes_used() == 0);
 
   // Make sure it still works as expected
   numbers.push_back(20);
@@ -252,4 +280,5 @@ CASE("mem::buddy as std::allocator") {
 
   numbers.clear();
   numbers.shrink_to_fit();
+  EXPECT(resource->bytes_used() == 0);
 }
