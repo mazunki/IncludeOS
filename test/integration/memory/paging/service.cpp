@@ -203,9 +203,9 @@ void verify_integrity(){
   mem::Map far;
   far.lin   = near + far_distance;
   far.phys  = near;
-  far.flags = mem::Access::read | mem::Access::write;
+  far.attrs = mem::Permission::Data;
   far.size  = 100_MiB;
-  far.page_sizes = mem::Map::any_size;
+  far.page_sizes = os::mem::supported_page_sizes();
 
   //#define HIGHMEM_LOCATION  (1ull << 45)
   //const uintptr_t lu_phys = mem::virt_to_phys(HIGHMEM_LOCATION);
@@ -217,15 +217,15 @@ void verify_integrity(){
 
   auto res = mem::map(far);
   Expects(res and res.size == far.size);
-  Expects(res.flags == far.flags);
-  Expects(res.page_sizes == (2_MiB | 4_KiB));
+  Expects(res.attrs == far.attrs);
+  Expects(res.page_sizes == os::mem::page_sizes_t{2_MiB | 4_KiB});
 
-  std::cout << "* Populating near memory with " << util::Byte_r(res.size) << " random data\n";
+  std::cout << "* Populating near memory with " << util::Byte_r(static_cast<size_t>(res.size)) << " random data\n";
   uintptr_t* near_ptr = (uintptr_t*)near;
   //memset(near_ptr, rand64(), range_size);*/
   auto val = rand64();
 
-  size_t count = res.size / sizeof(val);
+  size_t count = static_cast<size_t>(res.size) / sizeof(val);
   std::fill(near_ptr, near_ptr + count, val);
 
   uintptr_t bytes_ok = 0;
@@ -235,7 +235,7 @@ void verify_integrity(){
   }
 
   bytes_ok = 0;
-  uintptr_t* far_ptr = (uintptr_t*)far.lin;
+  uintptr_t* far_ptr = reinterpret_cast<uintptr_t*>(far.lin.value);
   for (uintptr_t i = 0; i < count; i++){
     Expects(near_ptr[i] == val);
     Expects(far_ptr[i] == near_ptr[i]);
@@ -258,8 +258,8 @@ void verify_magic() {
   auto m = __pml4->map_r({magic_loc, (uintptr_t)magic_phys,
         Pflag::writable | Pflag::present | Pflag::huge, 4_KiB});
   Expects(m);
-  Expects(m.page_sizes == mem::active_page_size(magic));
-  Expects(m.page_sizes == 4_KiB);
+  Expects(m.page_sizes == os::mem::page_sizes_t{mem::active_page_size(magic).bytes()});
+  Expects(m.page_sizes == os::mem::page_sizes_t{4_KiB});
   Expects(m.size == 4_KiB);
   Expects(m.lin  == magic_loc);
   Expects(m.phys == (uintptr_t)magic_phys);
@@ -326,7 +326,7 @@ void memmap_vs_pml4()
     for (auto rz : randz)
     {
       auto* ent = __pml4->entry_r(rz);
-      if (ent != nullptr && __pml4->addr_of(*ent) != 0) {
+      if (ent != nullptr && ent->addr_bits() != 0) {
         //printf("__pml4: 0x%lx YES\n", rz);
         match++;
       }else {
@@ -342,8 +342,8 @@ void memmap_vs_pml4()
 void map_non_aligned(){
 
   std::cout << "Verifying non-aligned mappings fail gracefully\n";
-  std::cout << "* Allowed page sizes: " << mem::page_sizes_str(mem::supported_page_sizes()) << "\n";
-  auto psize = bits::keeplast(mem::supported_page_sizes());
+  std::cout << "* Allowed page sizes: " << mem::supported_page_sizes().to_string() << "\n";
+  auto psize = bits::keeplast(mem::supported_page_sizes().mask);
 
   auto far_addr1 = 222_GiB;
   auto far_addr2 = 223_GiB;
@@ -356,10 +356,10 @@ void map_non_aligned(){
             << Byte_r(near_addr1) << ", no page size restrictions \n";
 
   // OK - we don't supply page size, only size
-  auto res = mem::map({far_addr1, near_addr1, mem::Access::read | mem::Access::write, psize});
+  auto res = mem::map({far_addr1, near_addr1, mem::Permission::Data, psize});
   Expects(res);
   Expects(res.size == psize);
-  Expects(res.page_sizes & 4_KiB);
+  Expects(res.page_sizes.intersects(os::mem::page_sizes_t{4_KiB}));
   char* far_ptr = (char*) far_addr1;
   char* near_ptr = (char*) near_addr1;
   far_ptr[42] = '!';
@@ -369,7 +369,7 @@ void map_non_aligned(){
   std::cout << "* Mapping a " << util::Byte_r(psize) << " page to "
             << Byte_r(near_addr2) << ", requiring page size " << Byte_r(psize) << "\n";
   try {
-    mem::map({far_addr2, near_addr2, mem::Access::read | mem::Access::write, psize, psize});
+    mem::map({far_addr2, near_addr2, mem::Permission::Data, psize, os::mem::page_sizes_t{psize}});
   } catch (mem::Memory_exception& e) {
     Expects(std::string(e.what()).find(std::string("linear and physical must be aligned to requested page size")));
     std::cout << "* Exception caught as expected\n";
@@ -398,34 +398,34 @@ int main()
   prot.lin         = (uintptr_t) protected_page;
   prot.phys        = (uintptr_t) protected_page_phys;
   prot.size        = 4_KiB;
-  prot.page_sizes  = 4_KiB;
-  prot.flags       = mem::Access::read | mem::Access::write;
+  prot.page_sizes  = os::mem::page_sizes_t{4_KiB};
+  prot.attrs       = mem::Permission::Data;
 
   mem::Map mapped;
   int expected_reboots = 4;
   if (magic->reboots < expected_reboots) {
     std::cout << "Protection fault test setup\n";
-    std::cout << "* Mapping protected page @ " << prot << "\n";
+    std::cout << "* Mapping protected page @ " << prot.to_string() << "\n";
     mapped = mem::map(prot, "Protected test page");
-    mem::protect_range((uint64_t)protected_page, mem::Access::read | mem::Access::write);
+    mem::protect_range((uint64_t)protected_page, mem::Permission::Data);
     Expects(mapped && mapped == prot);
   }
 
-  auto pml3 = __pml4->page_dir(__pml4->entry(magic_loc));
-  auto pml2 = pml3->page_dir(pml3->entry(magic_loc));
-  auto pml1 = pml2->page_dir(pml2->entry(magic_loc));
+  auto pml3 = __pml4->page_dir(*__pml4->entry(magic_loc));
+  auto pml2 = pml3->page_dir(*pml3->entry(magic_loc));
+  auto pml1 = pml2->page_dir(*pml2->entry(magic_loc));
   (void) pml1;
 
   // Write-protect
   if (magic->reboots == 0) {
 
-    pml3 = __pml4->page_dir(__pml4->entry(mapped.lin));
-    pml2 = pml3->page_dir(pml3->entry(mapped.lin));
-    pml1 = pml2->page_dir(pml2->entry(mapped.lin));
+    pml3 = __pml4->page_dir(*__pml4->entry(mapped.lin));
+    pml2 = pml3->page_dir(*pml3->entry(mapped.lin));
+    pml1 = pml2->page_dir(*pml2->entry(mapped.lin));
     (void) pml1;
 
     protected_page[magic->i] = 'a';
-    mem::protect_range((uint64_t)protected_page, mem::Access::read);
+    mem::protect_range((uint64_t)protected_page, mem::Permission::ReadOnly);
     Expects(protected_page[magic->i] == 'a');
     std::cout << "* Writing to write-protected page, expecting page write fail\n\n";
     protected_page[magic->i] = 'b';
@@ -442,7 +442,7 @@ int main()
 
     // Read-protect (e.g. not present)
     std::cout << "* Reading non-present page, expecting page read fail\n\n";
-    mem::protect_range((uint64_t)protected_page, mem::Access::none);
+    mem::protect_range((uint64_t)protected_page, mem::Permission::Forbidden);
     Expects(protected_page[magic->i] == 'b');
   }
 
@@ -456,7 +456,7 @@ int main()
 
     // Execute protected page
     std::cout << "* Executing code from execute-protected page, expecting instruction fetch fail\n\n";
-    mem::protect_range((uint64_t)protected_page, mem::Access::read);
+    mem::protect_range((uint64_t)protected_page, mem::Permission::ReadOnly);
     ((void(*)())(&protected_page[magic->i]))();
   }
 
