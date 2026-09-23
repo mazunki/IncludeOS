@@ -10,7 +10,6 @@
 #include <kernel/memory.hpp>
 #include <kernel.hpp>
 #include <kprint>
-#include <new>
 #include <cstring>
 #include <util/pretty.hpp>
 
@@ -39,21 +38,11 @@ uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
     return aligned_begin;
   }
 
-  auto* self = reinterpret_cast<void*>(aligned_begin);
-  uintptr_t usable_begin = aligned_begin + sizeof(os::mem::buddy_resource);
+  os::mem::mem_region region{ aligned_begin, aligned_end };
+  buddy_alloc = os::mem::buddy_resource::create_at(region, os::mem::buddy_config{ .min_block = align });
+  Expects(buddy_alloc);
 
-  os::mem::mem_config cfg{
-    .region = { usable_begin, aligned_end },
-    .overbooking = false,
-  };
-
-  os::mem::buddy_config bcfg{
-    .min_block = align,
-  };
-
-  buddy_alloc = new (self) os::mem::buddy_resource(cfg, bcfg);
   default_allocator = buddy_alloc;
-
   return aligned_end;
 }
 

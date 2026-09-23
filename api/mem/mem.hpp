@@ -7,12 +7,20 @@
 #include <bit>
 #include <cstring>
 #include <algorithm>
+#include <new>
+#include <type_traits>
 #ifdef INCLUDEOS_SMP_ENABLE
 #include <smp>
 #include <mutex>
 #endif
 
 namespace os::mem {
+
+// rounds p up to the nearest multiple of alignment (which must be a power of two)
+inline constexpr std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment) noexcept {
+  const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
+  return (p + (a - 1)) & ~(a - 1);
+}
 struct mem_stats {
   std::size_t total_bytes{};          // total capacity of the allocator
   std::size_t busy_bytes{};           // including overhead of the underlying implementation
@@ -406,5 +414,29 @@ private:
   Spinlock alloc_lock_;
 #endif
 };
+
+/**
+ * places an allocator inside the region, with the allocator being slightly
+ * smaller than the region to make room for the header
+ *
+ * returns nullptr if region is too small to even hold the header
+ * Args are forwarded to the allocator constructor
+ */
+template <typename Strategy, typename... Args>
+Strategy* create_resource_at(mem_region region, Args&&... args)
+  noexcept(std::is_nothrow_constructible_v<Strategy, mem_config, Args...>)
+{
+  static_assert(std::is_base_of_v<mem_resource, Strategy>, "Strategy must derive from mem_resource");
+
+  const std::uintptr_t self_addr = align_up(region.start, alignof(Strategy));
+  const std::uintptr_t alloc_start = align_up(self_addr + sizeof(Strategy), alignof(std::max_align_t));
+
+  if (alloc_start >= region.end) {
+    return nullptr;
+  }
+
+  mem_config cfg{ .region = { alloc_start, region.end }, .overbooking = false };
+  return new (reinterpret_cast<void*>(self_addr)) Strategy(cfg, std::forward<Args>(args)...);
+}
 
 } // namespace os::mem

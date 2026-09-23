@@ -1,4 +1,3 @@
-
 // This file is a part of the IncludeOS unikernel - www.includeos.org
 //
 // Copyright 2018 IncludeOS AS, Oslo, Norway
@@ -88,6 +87,12 @@ public:
 
     // initial free block = whole pool
     push_free(pool_base_, max_order_);
+  }
+
+  // self-hosts a buddy_resource at the front of region, same as
+  // arena_resource::create_at -- bcfg is forwarded to the constructor
+  static buddy_resource* create_at(mem_region region, buddy_config bcfg = {}) {
+    return create_resource_at<buddy_resource>(region, bcfg);
   }
 
   void dump_state() const noexcept {
@@ -415,11 +420,6 @@ private:
   std::size_t peak_busy_bytes_{0};
   std::uintptr_t highest_used_{0};
   std::uintptr_t peak_highest_used_{0};
-
-  static std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment) noexcept {
-    const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
-    return (p + (a - 1)) & ~(a - 1);
-  }
 
   /**
    * gets the corresponding order k big enough to hold the requested size
