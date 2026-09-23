@@ -95,22 +95,6 @@ public:
     return create_resource_at<buddy_resource>(region, bcfg);
   }
 
-  void dump_state() const noexcept {
-    std::println("buddy:");
-    std::println("  cfg.region:   [{:#x}, {:#x}) ({} bytes)",
-                 cfg_.region.start, cfg_.region.end,
-                 static_cast<std::size_t>(cfg_.region.end - cfg_.region.start));
-    std::println("  overbooking:   {}", cfg_.overbooking);
-
-    std::println("  min_block:     {}", bcfg_.min_block);
-    std::println("  resource_base: {:#x}", resource_base_);
-    std::println("  pool_base:     {:#x}", pool_base_);
-    std::println("  pool_end:      {:#x}", pool_end_);
-    std::println("  pool_size:     {} bytes (2^{})", pool_size_, max_order_);
-    std::println("  min_order:     {} (min bud = {} bytes)", min_order_, 1<<min_order_);
-    std::println("  max_order:     {} (max bud = {} bytes) ", max_order_, 1<<max_order_);
-  }
-
   uintptr_t malloc(size_t bytes) {
     return reinterpret_cast<uintptr_t>(this->strat_allocate(bytes, alignof(max_align_t)));
   }
@@ -134,6 +118,46 @@ public:
 
 protected:
   std::string_view name() const noexcept override { return "buddy"; }
+
+  void strat_summary() const noexcept override {
+    std::println("  min_block:     {}", bcfg_.min_block);
+    std::println("  resource_base: {:#x}", resource_base_);
+    std::println("  pool_base:     {:#x}", pool_base_);
+    std::println("  pool_end:      {:#x}", pool_end_);
+    std::println("  pool_size:     {} bytes (2^{})", pool_size_, max_order_);
+    std::println("  min_order:     {} (min bud = {} bytes)", min_order_, 1<<min_order_);
+    std::println("  max_order:     {} (max bud = {} bytes)", max_order_, 1<<max_order_);
+
+    std::println("  freelist (order: count x block_size):");
+    std::size_t largest_free = 0;
+    std::size_t free_blocks_total = 0;
+    for (int order = max_order_; order >= min_order_; --order) {
+      FreeNode* n = free_[idx(order)];
+      if (n == nullptr) continue;
+
+      std::size_t count = 0;
+      do {
+        ++count;
+        n = n->next;
+      } while (n != nullptr);
+
+      const std::size_t block_size = std::size_t(1) << order;
+      free_blocks_total += count;
+      if (largest_free == 0)
+        largest_free = block_size; // first hit will always be the largest
+
+      std::println("    {:>2}: {:>6} x {} bytes", order, count, block_size);
+    }
+
+    const std::size_t free_bytes = bytes_free();
+    const double fragmentation = (free_bytes > 0)
+      ? 1.0 - (static_cast<double>(largest_free) / static_cast<double>(free_bytes))
+      : 0.0;
+
+    std::println("  free_blocks:   {}", free_blocks_total);
+    std::println("  largest_free:  {} bytes", largest_free);
+    std::println("  fragmentation: {:.4f} (1 - largest_free/bytes_free; 0 = no fragmentation)", fragmentation);
+  }
 
   std::size_t strat_good_size(std::size_t bytes, std::size_t alignment) const noexcept override {
     // the good size will be an exact size since we split any bigger
