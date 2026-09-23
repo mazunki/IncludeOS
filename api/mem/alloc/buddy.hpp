@@ -1,4 +1,3 @@
-
 // This file is a part of the IncludeOS unikernel - www.includeos.org
 //
 // Copyright 2018 IncludeOS AS, Oslo, Norway
@@ -90,6 +89,12 @@ public:
     push_free(pool_base_, max_order_);
   }
 
+  // self-hosts a buddy_resource at the front of region, same as
+  // arena_resource::create_at -- bcfg is forwarded to the constructor
+  static buddy_resource* create_at(mem_region region, buddy_config bcfg = {}) {
+    return create_resource_at<buddy_resource>(region, bcfg);
+  }
+
   void dump_state() const noexcept {
     std::println("buddy:");
     std::println("  cfg.region:   [{:#x}, {:#x}) ({} bytes)",
@@ -104,6 +109,17 @@ public:
     std::println("  pool_size:     {} bytes (2^{})", pool_size_, max_order_);
     std::println("  min_order:     {} (min bud = {} bytes)", min_order_, 1<<min_order_);
     std::println("  max_order:     {} (max bud = {} bytes) ", max_order_, 1<<max_order_);
+  }
+
+  // capacity is usable bytes; header space is added on top
+  static buddy_resource* create_from(mem_resource& parent, std::size_t capacity, buddy_config bcfg = {}) {
+    const std::size_t total = sizeof(buddy_resource) + alignof(buddy_resource) + capacity;
+    mem_region region = parent.allocate_region(total, alignof(buddy_resource));
+    buddy_resource* child = create_at(region, bcfg);
+    if (!child) {
+      parent.deallocate_region(region, alignof(buddy_resource));
+    }
+    return child;
   }
 
   uintptr_t malloc(size_t bytes) {
@@ -415,11 +431,6 @@ private:
   std::size_t peak_busy_bytes_{0};
   std::uintptr_t highest_used_{0};
   std::uintptr_t peak_highest_used_{0};
-
-  static std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment) noexcept {
-    const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
-    return (p + (a - 1)) & ~(a - 1);
-  }
 
   /**
    * gets the corresponding order k big enough to hold the requested size
