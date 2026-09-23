@@ -110,6 +110,16 @@ public:
     return config_.region.owns(reinterpret_cast<std::uintptr_t>(p));
   }
 
+  /* offsets from start of this allocator */
+  virtual std::size_t offset_of(uintptr_t addr) const noexcept {
+    return addr - config_.region.start;
+  }
+
+  /* backing addresses for offset addresses */
+  virtual uintptr_t addr_at(std::size_t offset) const noexcept {
+    return config_.region.start + offset;
+  }
+
   /**
    * how much would be reserved as a lower bound for a request of this size
    */
@@ -135,6 +145,12 @@ public:
    **/
   mem_region allocate_region(std::size_t bytes, std::size_t alignment=alignof(std::max_align_t)) {
     void* p = this->allocate(bytes, alignment);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    return mem_region{ addr, addr + good_size(bytes, alignment) };
+  }
+
+  mem_region allocate_region_at(uintptr_t where, std::size_t bytes, bool permit_override, std::size_t alignment=alignof(std::max_align_t)) {
+    void* p = allocate_at(reinterpret_cast<void*>(where), bytes, permit_override, alignment);
     const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
     return mem_region{ addr, addr + good_size(bytes, alignment) };
   }

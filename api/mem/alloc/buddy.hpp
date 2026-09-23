@@ -106,6 +106,14 @@ public:
     return child;
   }
 
+  std::size_t offset_of(uintptr_t addr) const noexcept override {
+    return addr - pool_base_;
+  }
+
+  uintptr_t addr_at(std::size_t offset) const noexcept override {
+    return pool_base_ + offset;
+  }
+
   uintptr_t malloc(size_t bytes) {
     return reinterpret_cast<uintptr_t>(this->strat_allocate(bytes, alignof(max_align_t)));
   }
