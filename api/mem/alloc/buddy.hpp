@@ -425,6 +425,10 @@ protected:
       if (!block_is_free(addr, order, base, have)) {
         throw os::mem::allocator_error("os::mem::buddy_allocator::strat_allocate_at: no free block contains requested address");
       }
+
+      if (have > order) {
+        base = split_towards(base, have, order, addr);
+      }
     }
 
     /* tracing metainfo */
