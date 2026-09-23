@@ -22,7 +22,7 @@
 #include <print>
 #include <stdexcept>
 #include <string_view>
-#include <vector>
+#include <array>
 #include <algorithm>
 
 #include <mem/mem.hpp>
@@ -133,6 +133,118 @@ public:
 
   uintptr_t highest_used() const noexcept override {
     return peak_highest_used_;
+  }
+
+  void draw_tiles(std::size_t cols = 64) const noexcept {
+    static constexpr std::size_t max_tiles = 1024;
+    if (pool_size_ == 0) return;
+
+    std::size_t total_tiles = pool_size_ / bcfg_.min_block;
+    if (total_tiles > max_tiles) total_tiles = max_tiles;
+    if (total_tiles == 0) total_tiles = 1;
+    if (cols > total_tiles) cols = total_tiles;
+
+    static constexpr int used_color = 240; // xterm grey
+    static constexpr std::array<int, 16> color_palette = { 196, 208, 220, 46, 51, 33, 129, 201, 165, 214, 118, 45, 27, 93, 205, 172 };
+
+    struct Seg { std::uintptr_t start, end; int color; char sym; };
+    static constexpr std::size_t max_free_segs = 512;
+    static constexpr std::size_t max_segs = max_free_segs * 2 + 2;
+    static Seg free_segs[max_free_segs];
+    std::size_t n_free = 0;
+
+    std::println("  tile legend:");
+
+    for (int order = max_order_; order >= min_order_; --order) {
+      FreeNode* n = free_[idx(order)];
+      if (n == nullptr) continue;
+
+      const int color = color_palette[static_cast<std::size_t>(order) % color_palette.size()];
+      const std::size_t block_size = std::size_t(1) << order;
+
+      const std::size_t first = n_free;
+      do {
+        if (n_free < max_free_segs) {
+          const auto addr = reinterpret_cast<std::uintptr_t>(n);
+          free_segs[n_free++] = { addr, addr + block_size, color, '.' }; // sym fixed up below
+        }
+        n = n->next;
+      } while (n != nullptr);
+
+      std::println("    \x1b[48;5;{}m  \x1b[0m order {} = {} bytes ({})", color, order, block_size, n_free - first);
+    }
+
+    std::sort(free_segs, free_segs + n_free, [](const Seg& a, const Seg& b) {
+      return a.start < b.start;
+    });
+
+    for (std::size_t i = 0; i < n_free; ++i) {
+      free_segs[i].sym = (i % 2 == 0) ? '.' : '-';  // makes it easier to visuyally separate contiguous regions of same order
+    }
+
+    static Seg segs[max_segs];
+    std::size_t n_segs = 0;
+    auto push_seg = [&](std::uintptr_t start, std::uintptr_t end, int color, char sym) {
+      if (n_segs < max_segs)
+        segs[n_segs++] = { start, end, color, sym };
+    };
+
+    std::uintptr_t cursor = pool_base_;
+    for (std::size_t i = 0; i < n_free; ++i) {
+      if (free_segs[i].start > cursor)
+        push_seg(cursor, free_segs[i].start, used_color, '@');
+
+      push_seg(free_segs[i].start, free_segs[i].end, free_segs[i].color, free_segs[i].sym);
+
+      if (free_segs[i].end > cursor)
+        cursor = free_segs[i].end;
+    }
+    if (cursor < pool_end_)
+      push_seg(cursor, pool_end_, used_color, '@');
+
+    auto classify_tile = [&](std::uintptr_t tile_start, std::uintptr_t tile_end) -> std::pair<char, int> {
+      std::size_t overlap_count = 0;
+      int dominant_color = used_color;
+      char dominant_sym = '@';
+      std::size_t best_overlap = 0;
+
+      for (std::size_t i = 0; i < n_segs; ++i) {
+        const std::uintptr_t s = std::max(tile_start, segs[i].start);
+        const std::uintptr_t e = std::min(tile_end, segs[i].end);
+        if (e <= s) continue;
+        ++overlap_count;
+        if ((e - s) > best_overlap) {
+          best_overlap = e - s;
+          dominant_color = segs[i].color;
+          dominant_sym = segs[i].sym;
+        }
+      }
+
+      if (overlap_count <= 1) return { dominant_sym, dominant_color };
+      return { static_cast<char>('0' + std::min(overlap_count, std::size_t(9))), dominant_color };
+    };
+
+    const std::size_t tile_size = pool_size_ / total_tiles;
+
+    std::println("  tile map (~{} bytes/tile; '@'=full, '.'/'-'=empty, digit=N suborders):", tile_size);
+    for (std::size_t row = 0; row < total_tiles; row += cols) {
+      const std::uintptr_t row_addr = pool_base_ + row * tile_size;
+
+      std::print("    \x1b[90m{:#012x}\x1b[0m  ", row_addr);  // backing address
+
+      const std::size_t row_end = std::min(row + cols, total_tiles);
+      for (std::size_t t = row; t < row_end; ++t) {
+        const std::uintptr_t tile_start = pool_base_ + t * tile_size;
+        const auto [c, color] = classify_tile(tile_start, tile_start + tile_size);
+
+        if (c == '@') {
+          std::print("{}", c);
+        } else {
+          std::print("\x1b[48;5;{}m{}\x1b[0m", color, c);
+        }
+      }
+      std::println("  \x1b[90m{:#010x}\x1b[0m", row_addr - pool_base_); // offset address
+    }
   }
 
 protected:
