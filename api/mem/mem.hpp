@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <new>
+#include <print>
 #include <type_traits>
 #ifdef INCLUDEOS_SMP_ENABLE
 #include <smp>
@@ -21,6 +22,7 @@ inline constexpr std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment
   const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
   return (p + (a - 1)) & ~(a - 1);
 }
+
 struct mem_stats {
   std::size_t total_bytes{};          // total capacity of the allocator
   std::size_t busy_bytes{};           // including overhead of the underlying implementation
@@ -220,6 +222,17 @@ public:
   virtual size_t bytes_free() const noexcept = 0;
   virtual uintptr_t highest_used() const noexcept = 0;
 
+  void dump_state() const noexcept {
+    std::println("{}:", name());
+    std::println("  region:        [{:#x}, {:#x}) ({} bytes)",
+                 config_.region.start, config_.region.end, config_.region.size());
+    std::println("  overbooking:   {}", config_.overbooking);
+    std::println("  bytes_used:    {}", bytes_used());
+    std::println("  bytes_free:    {}", bytes_free());
+    std::println("  highest_used:  {:#x}", highest_used());
+    strat_summary();
+  }
+
 protected:
   /**
    * these are the *strategy hooks*, need to be implemented by your allocator
@@ -318,6 +331,11 @@ protected:
   }
 
   virtual std::string_view name() const noexcept = 0;
+
+  /**
+   * optional allocat-specific addition to dump_state()
+   */
+  virtual void strat_summary() const noexcept {}
 
 private:
   /**
