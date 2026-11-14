@@ -23,9 +23,16 @@
 static os::mem::buddy_resource* buddy_alloc = nullptr;
 static os::mem::mem_resource* default_allocator = nullptr;
 
+static os::mem::buddy_resource* buddy_alloc_2 = nullptr;
+static os::mem::mem_resource* allocator_2 = nullptr;
+
 os::mem::mem_resource& os::mem::raw_allocator() {
   Expects(default_allocator);
   return *default_allocator;
+}
+
+os::mem::mem_resource* os::mem::secondary_allocator() {
+  return allocator_2;
 }
 
 uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
@@ -43,6 +50,22 @@ uintptr_t __init_mmap(uintptr_t addr_begin, size_t size)
   Expects(buddy_alloc);
 
   default_allocator = buddy_alloc;
+  return aligned_end;
+}
+
+uintptr_t __init_mmap_secondary(uintptr_t addr_begin, uintptr_t addr_end)
+{
+  size_t align = PAGE_SIZE;
+  auto aligned_begin = (addr_begin + align - 1) & ~(align - 1);
+  auto aligned_end   = addr_end & ~(uintptr_t(align - 1));
+
+  if (aligned_end <= aligned_begin) {
+    return aligned_begin;
+  }
+
+  os::mem::mem_region region{ aligned_begin, aligned_end };
+  buddy_alloc_2 = os::mem::buddy_resource::create_at(region, os::mem::buddy_config{ .min_block = align });
+  allocator_2 = buddy_alloc_2;
   return aligned_end;
 }
 

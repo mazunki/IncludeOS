@@ -240,6 +240,9 @@ namespace os::mem {
   /** Get default allocator for untyped allocations */
   os::mem::mem_resource& raw_allocator();
 
+  /* secondary allocator which isn't used by default */
+  os::mem::mem_resource* secondary_allocator();
+
   template <typename T>
   using Typed_allocator = Allocator<T, os::mem::mem_resource>;
 

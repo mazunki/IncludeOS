@@ -49,6 +49,7 @@ extern uintptr_t _ELF_END_;
 extern bool os_default_stdout;
 
 extern std::span<multiboot_memory_map_t> _multiboot_memory_maps();
+extern uintptr_t __init_mmap_secondary(uintptr_t, uintptr_t);
 
 struct alignas(SMP_ALIGN) OS_CPU {
   uint64_t cycles_hlt = 0;
@@ -143,12 +144,19 @@ void kernel::start(uint32_t boot_magic, uint32_t boot_addr)
   memmap.assign_range({0x10000, 0x9d3ff, "Stack"});
 #endif
 
+  static constexpr uint64_t heap_split_4g = 0x1'0000'0000ULL;
+
   multiboot_memory_map_t heap_map = {0,0,0,0};
+  multiboot_memory_map_t heap_map_high = {0,0,0,0};
   for (auto entry : _multiboot_memory_maps())
   {
     if (not entry.is_available()) continue;
 
-    if (entry.len > heap_map.len) {
+    if (entry.addr >= heap_split_4g) {
+      if (entry.len > heap_map_high.len) {
+        heap_map_high = entry;
+      }
+    } else if (entry.len > heap_map.len) {
       heap_map = entry;
     }
   }
@@ -167,6 +175,15 @@ void kernel::start(uint32_t boot_magic, uint32_t boot_addr)
 
   INFO2("* Assigning heap 0x%lx -> 0x%lx", kernel::heap_begin(), kernel::heap_max());
   memmap.assign_range({kernel::heap_begin(), kernel::heap_max(), "Heap", kernel::heap_usage });
+
+  if (heap_map_high.len > 0) {
+    const uintptr_t hi_begin = heap_map_high.addr;
+    const uintptr_t hi_end = heap_map_high.addr + heap_map_high.len - 1;
+    __init_mmap_secondary(hi_begin, hi_end + 1);
+
+    INFO2("* Assigning secondary heap 0x%lx -> 0x%lx", hi_begin, hi_end);
+    memmap.assign_range({hi_begin, hi_end, "Heap (secondary)"});
+  }
 
   MYINFO("Virtual memory map");
   for (const auto& entry : memmap)
