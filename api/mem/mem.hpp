@@ -23,6 +23,12 @@ inline constexpr std::uintptr_t align_up(std::uintptr_t p, std::size_t alignment
   return (p + (a - 1)) & ~(a - 1);
 }
 
+// TODO: find a better place for me
+template <typename T>
+constexpr double safe_div(T n, T div, double fallback = 0.0) noexcept {
+  return div != T(0) ? static_cast<double>(n) / static_cast<double>(div) : fallback;
+}
+
 struct mem_stats {
   std::size_t total_bytes{};          // total capacity of the allocator
   std::size_t busy_bytes{};           // including overhead of the underlying implementation
@@ -237,6 +243,11 @@ public:
   virtual size_t bytes_used() const noexcept = 0;
   virtual size_t bytes_free() const noexcept = 0;
   virtual uintptr_t highest_used() const noexcept = 0;
+
+  // largest single allocation that would succeed now; exact when free space is contiguous
+  virtual std::size_t largest_free() const noexcept {
+    return bytes_free();
+  }
 
   void dump_state() const noexcept {
     std::println("{}:", name());

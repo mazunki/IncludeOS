@@ -26,8 +26,11 @@
 #include <algorithm>
 
 #include <mem/mem.hpp>
+#include <util/pretty.hpp>
 
 namespace os::mem {
+
+using util::format::Bytes;
 
 struct buddy_config {
   std::size_t min_block = 64; // must be power of two
@@ -89,8 +92,6 @@ public:
     push_free(pool_base_, max_order_);
   }
 
-  // self-hosts a buddy_resource at the front of region, same as
-  // arena_resource::create_at -- bcfg is forwarded to the constructor
   static buddy_resource* create_at(mem_region region, buddy_config bcfg = {}) {
     return create_resource_at<buddy_resource>(region, bcfg);
   }
@@ -135,6 +136,49 @@ public:
     return peak_highest_used_;
   }
 
+  // the largest free block; free space is often split, so bytes_free() overstates it
+  std::size_t largest_free() const noexcept override {
+    for (int order = max_order_; order >= min_order_; --order) {
+      if (free_[idx(order)] != nullptr) return std::size_t(1) << order;
+    }
+    return 0;
+  }
+
+  // free blocks across all orders
+  std::size_t free_blocks() const noexcept {
+    std::size_t count = 0;
+    for (int order = max_order_; order >= min_order_; --order) {
+      for (FreeNode* n = free_[idx(order)]; n != nullptr; n = n->next) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  // fewest blocks bytes_free() could be split into: one per set bit
+  std::size_t ideal_free_blocks() const noexcept {
+    return static_cast<std::size_t>(std::popcount(bytes_free()));
+  }
+
+  // 0 = as few free blocks as possible, towards 1 = scattered
+  double block_fragmentation() const noexcept {
+    const std::size_t actual = free_blocks();
+    if (actual == 0) return 0.0;
+    return 1.0 - (static_cast<double>(ideal_free_blocks()) / static_cast<double>(actual));
+  }
+
+  // 0 = all free bytes in one block, towards 1 = scattered
+  double size_fragmentation() const noexcept {
+    const std::size_t free_bytes = bytes_free();
+    if (free_bytes == 0) return 0.0;
+    return 1.0 - (static_cast<double>(largest_free()) / static_cast<double>(free_bytes));
+  }
+
+  // largest allocation if live blocks could be moved; a power of two, so usually below bytes_free()
+  std::size_t ideal_size_allocatable() const noexcept {
+    return std::bit_floor(bytes_free());
+  }
+
   void draw_tiles(std::size_t cols = 64) const noexcept {
     static constexpr std::size_t max_tiles = 1024;
     if (pool_size_ == 0) return;
@@ -153,7 +197,7 @@ public:
     static Seg free_segs[max_free_segs];
     std::size_t n_free = 0;
 
-    std::println("  tile legend:");
+    std::println("  free chunks tile legend:");
 
     for (int order = max_order_; order >= min_order_; --order) {
       FreeNode* n = free_[idx(order)];
@@ -171,7 +215,7 @@ public:
         n = n->next;
       } while (n != nullptr);
 
-      std::println("    \x1b[48;5;{}m  \x1b[0m order {} = {} bytes ({})", color, order, block_size, n_free - first);
+      std::println("    \x1b[48;5;{}m  \x1b[0m order {} = {} ({})", color, order, Bytes{block_size}, n_free - first);
     }
 
     std::sort(free_segs, free_segs + n_free, [](const Seg& a, const Seg& b) {
@@ -226,7 +270,7 @@ public:
 
     const std::size_t tile_size = pool_size_ / total_tiles;
 
-    std::println("  tile map (~{} bytes/tile; '@'=full, '.'/'-'=empty, digit=N suborders):", tile_size);
+    std::println("  tile map (~{} bytes/tile; '@'=fully allocated, '.'/'-'=empty, digit=N suborders):", tile_size);
     for (std::size_t row = 0; row < total_tiles; row += cols) {
       const std::uintptr_t row_addr = pool_base_ + row * tile_size;
 
@@ -256,11 +300,10 @@ protected:
     std::println("  pool_base:     {:#x}", pool_base_);
     std::println("  pool_end:      {:#x}", pool_end_);
     std::println("  pool_size:     {} bytes (2^{})", pool_size_, max_order_);
-    std::println("  min_order:     {} (min bud = {} bytes)", min_order_, 1<<min_order_);
-    std::println("  max_order:     {} (max bud = {} bytes)", max_order_, 1<<max_order_);
+    std::println("  min_order:     {} (min bud = {} bytes)", min_order_, std::size_t(1) << min_order_);
+    std::println("  max_order:     {} (max bud = {} bytes)", max_order_, std::size_t(1) << max_order_);
 
     std::println("  freelist (order: count x block_size):");
-    std::size_t largest_free = 0;
     std::size_t free_blocks_total = 0;
     for (int order = max_order_; order >= min_order_; --order) {
       FreeNode* n = free_[idx(order)];
@@ -272,22 +315,20 @@ protected:
         n = n->next;
       } while (n != nullptr);
 
-      const std::size_t block_size = std::size_t(1) << order;
       free_blocks_total += count;
-      if (largest_free == 0)
-        largest_free = block_size; // first hit will always be the largest
 
-      std::println("    {:>2}: {:>6} x {} bytes", order, count, block_size);
+      std::println("    {:>2}: {:>6} x {} bytes", order, count, std::size_t(1) << order);
     }
 
-    const std::size_t free_bytes = bytes_free();
-    const double fragmentation = (free_bytes > 0)
-      ? 1.0 - (static_cast<double>(largest_free) / static_cast<double>(free_bytes))
-      : 0.0;
-
-    std::println("  free_blocks:   {}", free_blocks_total);
-    std::println("  largest_free:  {} bytes", largest_free);
-    std::println("  fragmentation: {:.4f} (1 - largest_free/bytes_free; 0 = no fragmentation)", fragmentation);
+    std::println("  free_blocks:            {} (ideal = {})", free_blocks_total, ideal_free_blocks());
+    {
+      const std::size_t free_bytes = bytes_free();
+      const double largest_pct = 100.0 * safe_div(largest_free(), free_bytes);
+      const double ideal_pct = 100.0 * safe_div(ideal_size_allocatable(), free_bytes);
+      std::println("  largest_free:           {} ({:.2f}% of free bytes)", Bytes{largest_free()}, largest_pct);
+      std::println("  ideal_size_allocatable: {} ({:.2f}% of free bytes)", Bytes{ideal_size_allocatable()}, ideal_pct);
+    }
+    std::println("  block_fragmentation:    {:.2f}% (free_blocks vs. the fewest blocks that free space could be)", block_fragmentation() * 100.0);
   }
 
   std::size_t strat_good_size(std::size_t bytes, std::size_t alignment) const noexcept override {
