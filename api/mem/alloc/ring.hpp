@@ -28,21 +28,21 @@
 
 namespace os::mem {
 
-struct snake_config {
+struct ring_config {
   std::size_t align = alignof(std::max_align_t); // every allocation's reserved size is rounded up to a multiple of this
   std::size_t max_pending = 1024; // max concurrent live allocations + wrap-gaps, tracked in a self-hosted queue
 };
 
-class snake_resource final : public mem_resource {
+class ring_resource final : public mem_resource {
 public:
-  snake_resource(mem_config cfg, snake_config rcfg = {})
+  ring_resource(mem_config cfg, ring_config rcfg = {})
     : mem_resource(cfg), cfg_(cfg), rcfg_(rcfg)
   {
     if (!std::has_single_bit(rcfg_.align)) {
-      throw std::invalid_argument("snake align must be a power of two");
+      throw std::invalid_argument("ring align must be a power of two");
     }
     if (rcfg_.max_pending == 0) {
-      throw std::invalid_argument("snake max_pending must be > 0");
+      throw std::invalid_argument("ring max_pending must be > 0");
     }
 
     resource_base_ = cfg_.region.start;
@@ -56,20 +56,17 @@ public:
     capacity_ = cfg_.region.end - pool_base_;
   }
 
-  static snake_resource* create_at(mem_region region, snake_config rcfg = {}) {
-    return create_resource_at<snake_resource>(region, rcfg);
+  static ring_resource* create_at(mem_region region, ring_config rcfg = {}) {
+    return create_resource_at<ring_resource>(region, rcfg);
   }
 
-  /**
-   * carves at least `capacity` usable bytes out of parent and self-hosts a
-   * child snake in it. the header overhead is added on top automatically.
-   */
-  static snake_resource* create_from(mem_resource& parent, std::size_t capacity, snake_config rcfg = {}) {
-    const std::size_t total = sizeof(snake_resource) + alignof(snake_resource) + capacity;
-    mem_region region = parent.allocate_region(total, alignof(snake_resource));
-    snake_resource* child = create_at(region, rcfg);
+  // capacity is usable bytes; header space is added on top
+  static ring_resource* create_from(mem_resource& parent, std::size_t capacity, ring_config rcfg = {}) {
+    const std::size_t total = sizeof(ring_resource) + alignof(ring_resource) + capacity;
+    mem_region region = parent.allocate_region(total, alignof(ring_resource));
+    ring_resource* child = create_at(region, rcfg);
     if (!child) {
-      parent.deallocate_region(region, alignof(snake_resource));
+      parent.deallocate_region(region, alignof(ring_resource));
     }
     return child;
   }
@@ -96,7 +93,7 @@ public:
   }
 
 protected:
-  std::string_view name() const noexcept override { return "snake"; }
+  std::string_view name() const noexcept override { return "ring"; }
 
   void strat_summary() const noexcept override {
     std::println("  capacity:   {} bytes", capacity_);
@@ -117,7 +114,7 @@ protected:
   uintptr_t strat_allocate(std::size_t bytes, std::size_t alignment) override {
     const std::size_t size = strat_good_size(bytes, alignment);
     if (size == 0 || size > capacity_) {
-      throw os::mem::allocator_error("os::mem::snake_resource::strat_allocate: requested size exceeds the snake's total capacity");
+      throw os::mem::allocator_error("os::mem::ring_resource::strat_allocate: requested size exceeds the ring's total capacity");
     }
 
     const std::size_t phys_off = head_off_ % capacity_;
@@ -135,10 +132,10 @@ protected:
 
     const std::size_t total_needed = gap + size;
     if (total_needed > bytes_free()) {
-      throw os::mem::allocator_error("os::mem::snake_resource::strat_allocate: not enough free space, wrapping would run into still-live data");
+      throw os::mem::allocator_error("os::mem::ring_resource::strat_allocate: not enough free space, wrapping would run into still-live data");
     }
     if (span_count_ + (gap > 0 ? 2u : 1u) > rcfg_.max_pending) {
-      throw os::mem::allocator_error("os::mem::snake_resource::strat_allocate: pending-span bookkeeping queue is full (increase snake_config::max_pending)");
+      throw os::mem::allocator_error("os::mem::ring_resource::strat_allocate: pending-span bookkeeping queue is full (increase ring_config::max_pending)");
     }
 
     if (gap > 0) {
@@ -222,7 +219,7 @@ private:
   }
 
   mem_config cfg_;
-  snake_config rcfg_;
+  ring_config rcfg_;
 
   std::uintptr_t resource_base_{0};
   std::uintptr_t pool_base_{0};

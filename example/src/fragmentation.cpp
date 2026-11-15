@@ -7,7 +7,7 @@
 #include <string_view>
 #include <kernel/memory.hpp>
 #include <mem/alloc/buddy.hpp>
-#include <mem/alloc/snake.hpp>
+#include <mem/alloc/ring.hpp>
 #include "channel.hpp"
 
 inline void print_summary(os::mem::buddy_resource* buddy) {
@@ -92,9 +92,9 @@ int main() {
     return 1;
   }
 
-  auto* snake = os::mem::snake_resource::create_from(secondary, 1 << 22 /* 4 MiB */);
-  if (snake == nullptr) {
-    std::println("failed to make snake allocator");
+  auto* ring = os::mem::ring_resource::create_from(secondary, 1 << 22 /* 4 MiB */);
+  if (ring == nullptr) {
+    std::println("failed to make ring allocator");
     return 1;
   }
 
@@ -107,7 +107,7 @@ int main() {
 
   heap->deallocate_all();
 
-  packet_workload_demo(snake, heap, seed, "snake");
+  packet_workload_demo(ring, heap, seed, "ring");
   print_summary(heap);
 
   return 0;

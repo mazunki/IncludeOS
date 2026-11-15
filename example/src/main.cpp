@@ -6,7 +6,7 @@
 #include <kernel/memory.hpp>
 #include <mem/alloc/buddy.hpp>
 #include <mem/alloc/arena.hpp>
-#include <mem/alloc/snake.hpp>
+#include <mem/alloc/ring.hpp>
 
 using os::mem::Bytes;
 
@@ -109,19 +109,19 @@ int main() {
   }
 
   // step 2c
-  auto temp_snake_region = secondary.allocate_region(temp_region_size, alignof(std::max_align_t));
-  auto* temp_snake = os::mem::snake_resource::create_at(temp_snake_region, os::mem::snake_config{.max_pending = 32});
-  if (temp_snake == nullptr) {
-    std::println("failed to carve temp snake");
+  auto temp_ring_region = secondary.allocate_region(temp_region_size, alignof(std::max_align_t));
+  auto* temp_ring = os::mem::ring_resource::create_at(temp_ring_region, os::mem::ring_config{.max_pending = 32});
+  if (temp_ring == nullptr) {
+    std::println("failed to carve temp ring");
     return 1;
   }
   {
-    std::size_t min_free = temp_snake->bytes_free();
-    std::size_t min_largest = temp_snake->largest_free();
-    std::println("temp snake (standalone, {} raw region, {} usable) per-task free/largest_free:",
-                 Bytes{temp_region_size}, Bytes{temp_snake->bytes_free()});
+    std::size_t min_free = temp_ring->bytes_free();
+    std::size_t min_largest = temp_ring->largest_free();
+    std::println("temp ring (standalone, {} raw region, {} usable) per-task free/largest_free:",
+                 Bytes{temp_region_size}, Bytes{temp_ring->bytes_free()});
     int task_i = 0;
-    run_scratch_workload(temp_snake, seed, 50, 2, 5, PACKET_SIZES,
+    run_scratch_workload(temp_ring, seed, 50, 2, 5, PACKET_SIZES,
       [&](os::mem::mem_resource* a) {
         const std::size_t free_now = a->bytes_free();
         const std::size_t largest_now = a->largest_free();
@@ -129,16 +129,16 @@ int main() {
         min_largest = std::min(min_largest, largest_now);
         std::println("  task {:>2}: free={} largest_free={}", task_i++, Bytes{free_now}, Bytes{largest_now});
       });
-    std::println("temp snake (standalone):  min_free={} min_largest_free={}", Bytes{min_free}, Bytes{min_largest});
+    std::println("temp ring (standalone):  min_free={} min_largest_free={}", Bytes{min_free}, Bytes{min_largest});
   }
 
   // step 2d
   auto window_buddy_region = secondary.allocate_region(temp_region_size, alignof(std::max_align_t));
   auto* window_buddy = os::mem::buddy_resource::create_at(window_buddy_region, os::mem::buddy_config{.min_block = 64});
-  auto window_snake_region = secondary.allocate_region(temp_region_size, alignof(std::max_align_t));
-  auto* window_snake = os::mem::snake_resource::create_at(window_snake_region, os::mem::snake_config{.max_pending = 64});
-  if (window_buddy == nullptr || window_snake == nullptr) {
-    std::println("failed to carve window buddy/snake");
+  auto window_ring_region = secondary.allocate_region(temp_region_size, alignof(std::max_align_t));
+  auto* window_ring = os::mem::ring_resource::create_at(window_ring_region, os::mem::ring_config{.max_pending = 64});
+  if (window_buddy == nullptr || window_ring == nullptr) {
+    std::println("failed to carve window buddy/ring");
     return 1;
   }
   constexpr int window = 8;
@@ -152,11 +152,11 @@ int main() {
         std::println("  step {:>3}: free={} largest_free={}", step_i++, Bytes{a->bytes_free()}, Bytes{a->largest_free()});
       });
   }
-  std::println("window workload (snake, {} usable, window={}) free/largest_free over {} steps:",
-               Bytes{window_snake->bytes_free()}, window, n_steps);
+  std::println("window workload (ring, {} usable, window={}) free/largest_free over {} steps:",
+               Bytes{window_ring->bytes_free()}, window, n_steps);
   {
     int step_i = 0;
-    run_window_workload(window_snake, seed, n_steps, window, PACKET_SIZES,
+    run_window_workload(window_ring, seed, n_steps, window, PACKET_SIZES,
       [&](os::mem::mem_resource* a) {
         std::println("  step {:>3}: free={} largest_free={}", step_i++, Bytes{a->bytes_free()}, Bytes{a->largest_free()});
       });
